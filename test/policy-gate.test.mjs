@@ -75,9 +75,14 @@ test("une attestation sandbox active borne bash sans allowlist regex", (t) => {
     isActive: () => true,
   }), /already-active/);
 
+  // Sous sandbox, un risque nommé (git push = R3) est abaissé à R2 mais reste
+  // VISIBLE — la classification n'est plus court-circuitée en R1 aveugle
+  // (durcissement 2026-07-21 : cf. test/policy-gate-hardening.test.mjs).
   const sandboxed = classifyToolCall({ toolName: "bash", input: { command: "git push origin main" } });
-  assert.equal(sandboxed.risk, "R1");
-  assert.equal(sandboxed.findings[0].code, "sandboxed-shell");
+  assert.equal(sandboxed.risk, "R2");
+  assert.ok(sandboxed.findings.some((finding) => finding.code === "sandboxed-shell"));
+  assert.ok(sandboxed.findings.some((finding) => finding.code === "git-push"), "le risque nommé reste visible");
+  assert.equal(sandboxed.enforceDeny, false);
   assert.deepEqual(sandboxed.sandbox, { backend: "gondolin-test", hostMounts: 0, network: "deny" });
 
   active = false;

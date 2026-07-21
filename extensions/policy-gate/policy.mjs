@@ -38,6 +38,12 @@ const R3_PATTERNS = [
   { code: "remote-shell", summary: "exécution ou copie distante", pattern: /(?:^|[;&|]\s*|\s)(?:ssh|scp|sftp)\s+/i },
   { code: "http-mutation", summary: "requête HTTP avec effet de bord", pattern: /\bcurl\b[^\n;&|]*(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)\b|\bcurl\b[^\n;&|]*(?:--data(?:-[a-z-]+)?|-d|-F|--form(?:-string)?|--json|--upload-file|-T)(?:\s|=)/i },
   { code: "message-send", summary: "envoi de message externe", pattern: /(?:^|[;&|]\s*|\s)(?:mail|sendmail)\s+/i },
+  // Destruction hors `rm` — ajoutée après le challenge 2026-07-21 (tombait en R2 generic-shell).
+  { code: "find-destructive", summary: "suppression via find", deny: true, pattern: /\bfind\b[^\n;&|]*(?:-delete\b|-exec(?:dir)?\s+rm\b)/i },
+  { code: "truncate-data", summary: "troncature de données", deny: true, pattern: /(?:^|[;&|]\s*|\s)truncate\s+[^\n;&|]*-s\b/i },
+  // Interpréteurs à code inline : impossible à classifier statiquement → au plus haut (axe sécurité #1),
+  // mais SANS deny pour ne pas bloquer durement un `python3 -c 'print(1)'` bénin (le mode confirme).
+  { code: "opaque-execution", summary: "exécution de code inline non classifiable", pattern: /(?:^|[;&|]\s*|\s)(?:python[0-9.]*|node|deno|bun|ruby|perl|php|lua|osascript|sh|bash|zsh|fish)\s+(?:-[a-zA-Z]*\s+)*(?:-c|-e|--eval|--exec)\b/i },
 ];
 
 const R2_PATTERNS = [
@@ -172,19 +178,38 @@ export function classifyToolCall({ toolName, input = {}, cwd = process.cwd() }) 
   let enforceDeny = false;
 
   if (normalizedTool === "bash") {
+    const commandResult = classifyCommand(input.command);
     const sandbox = getActiveSandboxCapability(normalizedTool);
     if (sandbox) {
+      // Une attestation sandbox contient le rayon d'explosion. Elle réduit la
+      // friction pour le bénin/inconnu (contenu par la VM) MAIS ne masque jamais
+      // une opération à risque nommé : le finding destructif reste visible.
+      // (Correctif du challenge 2026-07-21 : l'ancien code renvoyait R1 aveugle,
+      // court-circuitant classifyCommand ; un `rm -rf /` passait silencieux.)
+      //
+      // - lecture reconnue (R0)                      → R0
+      // - commande non classifiée (generic-shell)    → R1 (contenue, faible friction)
+      // - risque nommé (rm, force-push, opaque, …)   → cap à R2, visible, confirmé, sans hard-deny
+      const substantive = commandResult.findings.some(
+        (f) => f.code !== "generic-shell" && f.code !== "read-only-command",
+      );
+      let downgraded;
+      if (commandResult.risk === "R0") downgraded = "R0";
+      else if (!substantive) downgraded = "R1";
+      else downgraded = commandResult.risk === "R3" ? "R2" : commandResult.risk;
       return {
         toolName: normalizedTool,
-        risk: "R1",
-        level: RISK_LEVELS.R1,
-        findings: [{ code: "sandboxed-shell", summary: `shell isolé par ${sandbox.backend}`, risk: "R1" }],
-        targets,
+        risk: downgraded,
+        level: RISK_LEVELS[downgraded],
+        findings: uniqueFindings([
+          { code: "sandboxed-shell", summary: `shell isolé par ${sandbox.backend}`, risk: downgraded },
+          ...commandResult.findings,
+        ]),
         enforceDeny: false,
+        targets,
         sandbox,
       };
     }
-    const commandResult = classifyCommand(input.command);
     return {
       toolName: normalizedTool,
       ...commandResult,
