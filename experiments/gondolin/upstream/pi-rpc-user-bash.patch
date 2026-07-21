@@ -1,0 +1,24 @@
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -551,8 +551,20 @@
+ 			// =================================================================
+ 
+ 			case "bash": {
++				const excludeFromContext = command.excludeFromContext ?? false;
++				const eventResult = await session.extensionRunner.emitUserBash({
++					type: "user_bash",
++					command: command.command,
++					excludeFromContext,
++					cwd: session.sessionManager.getCwd(),
++				});
++				if (eventResult?.result) {
++					session.recordBashResult(command.command, eventResult.result, { excludeFromContext });
++					return success(id, "bash", eventResult.result);
++				}
+ 				const result = await session.executeBash(command.command, undefined, {
+-					excludeFromContext: command.excludeFromContext,
++					excludeFromContext,
++					operations: eventResult?.operations,
+ 				});
+ 				return success(id, "bash", result);
+ 			}

@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "sandbox-b1",
+  "platform": "darwin",
+  "nodeMajor": 26,
+  "candidateSources": [
+    "Pi 0.80.10 examples/extensions/gondolin",
+    "Pi 0.80.10 examples/extensions/sandbox",
+    "npm package metadata"
+  ],
+  "candidates": {
+    "gondolin": {
+      "version": "0.12.0",
+      "license": "Apache-2.0",
+      "qemuAvailable": false,
+      "nodeCompatible": true,
+      "hostReady": false,
+      "preferred": true
+    },
+    "sandboxRuntime": {
+      "version": "0.0.26",
+      "license": "Apache-2.0",
+      "sandboxExecAvailable": true,
+      "hostReady": true,
+      "exampleSafeByDefault": false,
+      "provenanceRisk": "US-maintained local library; no remote service involved"
+    }
+  },
+  "licenseAudit": {
+    "gondolinTransitivePackages": 15,
+    "sandboxRuntimeTransitivePackages": 8,
+    "missingLockLicensesResolvedFromExactTarballs": {
+      "buildcheck@0.0.7": "MIT",
+      "cpu-features@0.0.10": "MIT",
+      "ssh2@1.17.0": "MIT"
+    },
+    "dualLicenseChoice": {
+      "node-forge@1.4.0": "BSD-3-Clause"
+    },
+    "forbiddenLicensesFound": 0,
+    "manualReview": {
+      "tweetnacl@0.14.5": "Unlicense is outside the local allowlist"
+    },
+    "gondolinPasses": false,
+    "sandboxRuntimePasses": true,
+    "passes": false
+  },
+  "blockingFindings": [
+    "Gondolin requires QEMU, which is absent.",
+    "The Gondolin example mounts the host workspace write-through and does not demonstrate deny-all networking.",
+    "The sandbox-runtime example permits network domains and falls back to unsandboxed bash after initialization failure."
+  ],
+  "decision": {
+    "verdict": "blocked",
+    "installPerformed": false,
+    "globalActivationAllowed": false,
+    "preferredBackend": "gondolin",
+    "nextGate": "Completed by the explicitly approved Gondolin spike.",
+    "supersededBy": "evals/reports/2026-07-20-gondolin-spike.json"
+  },
+  "runner": "scripts/sandbox-preflight.mjs",
+  "licenseRunner": "scripts/sandbox-license-audit.mjs",
+  "documentation": "docs/b1-sandbox-evaluation.md"
+}

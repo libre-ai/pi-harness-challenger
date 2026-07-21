@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "date": "2026-07-21",
+  "component": "sandbox-b1",
+  "gate": "mandatory-launcher-enforcement",
+  "valid": true,
+  "authorization": {
+    "licenseExceptionApproved": true,
+    "deploymentApproved": true,
+    "source": "explicit-user-policy-decision"
+  },
+  "license": {
+    "scope": "@earendil-works/gondolin@0.12.0 with tweetnacl@0.14.5 only",
+    "broaderUnlicenseApproval": false,
+    "licenseSha256": "88d9b4eb60579c191ec391ca04c16130572d7eedc4a86daa58bf28c6e14c9bcd",
+    "packageJsonSha256": "4d4e7122e483ab7bed48c884bb0de1471d3cb3753e1a334e3aafa3c32c22923e",
+    "runtimeFileSha256": "432333a18cef679d16c71328fcc18cc547e58d7d1c2b880a581b2d7ee4248027",
+    "reevaluationOnChangeRequired": true
+  },
+  "deployment": {
+    "profile": "gondolin-rpc-exclusive-cli-entrypoint",
+    "piVersion": "0.80.10",
+    "piArtifactSha256": "af302f231437eaf6f37691bce4b34234fcb626bcb5eb3910d4fc3f6519bf78ca",
+    "runtimeManifestEntryCount": 12,
+    "manifestSha256": "77581913fc4d2220cec243f0c51afe54b912775364219d706c5f29f11a4baf8a",
+    "piWrapperSha256": "ac0ad755df813c4225d8c0280dc41871f1490fc8b96c03dc614e53a381dbd012",
+    "launcherWrapperSha256": "019cfc6e521198b3b9cc447fa588e2972b3522e0365e64733d3c731aa05f760c",
+    "rpcEntryOriginalSha256": "7c3b46714f2d357f8b0d5403164663b60c13e62ef14dfc360ee757bdc16e02a0",
+    "rpcEntryGuardedSha256": "64ad85a1f55fbacdb69f2d65445b47bc81a1a0bddcb0fa5c437db4dcd9457519",
+    "atomicInstall": true,
+    "rollbackAvailable": true,
+    "directRpcRefused": true,
+    "directRpcEntryRefused": true,
+    "forgedMarkerDirectRpcRefused": true,
+    "incompleteLauncherRefused": true,
+    "interactivePiPreserved": true,
+    "piUpdateRequiresRollback": true,
+    "maxPromptChars": 100000,
+    "maxModelToolCalls": 64,
+    "maxSessionDurationMs": 600000,
+    "rpcModeCorePatched": false,
+    "rpcEntryGuardAtomicallyDeployed": true,
+    "challengerExtensionsGloballyConfigured": false,
+    "settingsModified": false
+  },
+  "failClosedProof": {
+    "runtimeManifestChangeRefused": true,
+    "budgetRuntimeResealRefusedOldManifest": true,
+    "refusalExitCode": 65,
+    "refusalError": "gondolin-rpc-deployment-integrity-refused",
+    "rollbackThenResealPassed": true
+  },
+  "installedLauncherE2E": {
+    "snapshotRequired": true,
+    "toolBudgetBoundaryTestPass": true,
+    "shortenedSessionBudgetExitCode": 124,
+    "shortenedSessionBudgetError": "session-time-budget-exceeded",
+    "nativeBashCommandRefused": true,
+    "explicitImportConfirmed": true,
+    "hostCanaryWritten": false,
+    "snapshotHostWrites": 0,
+    "providerCalled": false,
+    "extensionErrors": 0,
+    "allPass": true
+  },
+  "scope": {
+    "supportedBoundary": "installed pi, exported rpc-entry and pi-gondolin-rpc entrypoints",
+    "hostOwnerResistanceClaimed": false,
+    "absoluteInternalModuleInvocation": "outside supported boundary",
+    "reason": "the owner of a local account can always execute or alter owned code"
+  },
+  "decision": {
+    "verdict": "challenger-pass",
+    "gondolinProfilePromotion": "allowed",
+    "completePackageGlobalPromotion": "blocked-by-unsandboxed-policy-friction"
+  },
+  "runners": [
+    "experiments/gondolin/deploy-local.mjs",
+    "experiments/gondolin/deployed-rpc-e2e.mjs",
+    "experiments/gondolin/budget-test.mjs"
+  ]
+}

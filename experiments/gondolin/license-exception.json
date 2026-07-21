@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "approvedAt": "2026-07-21",
+  "approvedBy": "explicit-user-policy-decision",
+  "scope": {
+    "backend": "@earendil-works/gondolin@0.12.0",
+    "package": "tweetnacl@0.14.5",
+    "dependencyChain": [
+      "@earendil-works/gondolin@0.12.0",
+      "ssh2@1.17.0",
+      "bcrypt-pbkdf@1.0.2",
+      "tweetnacl@0.14.5"
+    ]
+  },
+  "artifacts": {
+    "lockfileIntegrity": "sha512-KXXFFdAbFXY4geFIwoyNK+f5Z1b7swfXABfL7HXCmoIWMKU3dmS26672A4EeQtDzLKy7SXmfBu51JolvEKwtGA==",
+    "licenseSha256": "88d9b4eb60579c191ec391ca04c16130572d7eedc4a86daa58bf28c6e14c9bcd",
+    "packageJsonSha256": "4d4e7122e483ab7bed48c884bb0de1471d3cb3753e1a334e3aafa3c32c22923e",
+    "runtimeFileSha256": "432333a18cef679d16c71328fcc18cc547e58d7d1c2b880a581b2d7ee4248027"
+  },
+  "constraints": {
+    "noBroaderUnlicenseApproval": true,
+    "reevaluateOnVersionOrHashChange": true,
+    "retainLicenseNotice": true,
+    "patentGrantNotAssumed": true,
+    "jurisdictionalUncertaintyAccepted": true
+  },
+  "approved": true
+}

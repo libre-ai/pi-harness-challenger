@@ -1,0 +1,41 @@
+{
+  "name": "pi-harness-gondolin-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Isolated fail-closed Gondolin spike; never loaded by the Pi package",
+  "bin": {
+    "pi-gondolin-rpc": "./safe-rpc-launcher.mjs"
+  },
+  "engines": {
+    "node": ">=23.6.0"
+  },
+  "scripts": {
+    "test:snapshot": "node snapshot-test.mjs",
+    "test:rpc-guard": "node safe-rpc-client-test.mjs",
+    "test:rpc-gate": "node rpc-gate-test.mjs",
+    "test:budgets": "node budget-test.mjs",
+    "deployment:install": "node deploy-local.mjs install",
+    "deployment:status": "node deploy-local.mjs status",
+    "deployment:rollback": "node deploy-local.mjs rollback",
+    "deployment:e2e": "node deployed-rpc-e2e.mjs",
+    "eval:remaining": "node remaining-cases-eval.mjs",
+    "eval:representative": "node representative-project-eval.mjs",
+    "eval:representative:handoff": "node representative-handoff-eval.mjs",
+    "check:upstream-proposal": "node upstream-proposal-check.mjs",
+    "spike": "node spike.mjs",
+    "spike:handoff": "node handoff-code-spike.mjs",
+    "spike:extension": "node extension-rpc-e2e.mjs",
+    "spike:rpc-launcher": "node safe-rpc-launcher-e2e.mjs",
+    "spike:agent": "node agent-rpc-e2e.mjs",
+    "spike:agent:policy": "node agent-rpc-e2e.mjs --with-policy",
+    "spike:agent:structured": "node agent-rpc-e2e.mjs --structured",
+    "spike:agent:structured:policy": "node agent-rpc-e2e.mjs --structured --with-policy",
+    "spike:agent:snapshot": "node agent-rpc-e2e.mjs --structured --with-policy --snapshot-apply"
+  },
+  "dependencies": {
+    "@earendil-works/gondolin": "0.12.0",
+    "typebox": "1.1.38"
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "handoff",
+  "providerModel": "openai-codex/gpt-5.6-sol",
+  "dataPolicy": "Session, marqueurs et identité factices ; fichier 0600 dans un workspace jetable ; aucun résumé ou contexte brut conservé.",
+  "methodNotes": [
+    "Deux tentatives sous le seuil ou sans préfixe compactable ont été invalidées.",
+    "Le score compare le brouillon au contexte post-compaction complet : résumé et entrées retenues.",
+    "La fixture volumineuse force le chemin natif de compaction et est volontairement pathologique.",
+    "Le runner reproductible est scripts/handoff-quality-eval.mjs."
+  ],
+  "result": {
+    "validRunCount": 3,
+    "expectedFacts": 7,
+    "handoff": {
+      "factsDetectedEachRun": [7, 7, 7],
+      "charsEachRun": [1058, 1058, 1058],
+      "durationMsRange": [1.08, 1.46],
+      "providerCallsPerRun": 0
+    },
+    "nativeCompaction": {
+      "factsDetectedEachRun": [7, 7, 7],
+      "contextCharsRange": [148440, 148488],
+      "summaryCharsRange": [590, 638],
+      "retainedEntriesEachRun": [9, 9, 9],
+      "durationMsRange": [4509, 10764],
+      "providerCallsPerRun": 1,
+      "tokensBeforeEachRun": [32616, 32616, 32616],
+      "estimatedTokensAfterRange": [37112, 37124]
+    },
+    "blindFactualContinuation": {
+      "nativeCompaction": {
+        "factsDetected": 7,
+        "parsedJson": true,
+        "toolCalls": 0,
+        "durationMs": 7562,
+        "totalTokens": 20358
+      },
+      "handoff": {
+        "factsDetected": 7,
+        "parsedJson": true,
+        "toolCalls": 0,
+        "durationMs": 7115,
+        "totalTokens": 1098
+      }
+    }
+  },
+  "interpretation": {
+    "demonstrated": [
+      "same exact-marker coverage on this fixture",
+      "focused transfer payload",
+      "no additional provider call",
+      "deterministic local generation",
+      "same 7/7 factual extraction in fresh sessions with 1098 versus 20358 total tokens"
+    ],
+    "notDemonstrated": [
+      "better downstream code-task completion",
+      "superiority on representative real sessions",
+      "lower token count on non-pathological compactions"
+    ]
+  },
+  "decision": {
+    "verdict": "retain-challenger",
+    "globalPromotion": "blocked",
+    "remainingGate": "Blind code-task completion on representative long sessions; keep human editor validation and existing leak tests."
+  }
+}

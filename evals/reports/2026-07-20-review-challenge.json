@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "review-challenge",
+  "providerModel": "openai-codex/gpt-5.6-sol",
+  "dataPolicy": "Dépôts et identités Git factices ; sorties brutes hors worktree puis supprimées ; rapport agrégé uniquement.",
+  "methodNotes": [
+    "Un premier run contaminé par les JSONL placés dans le worktree a été invalidé.",
+    "Les runs retenus placent toutes les sorties hors du dépôt fixture.",
+    "Les deux variantes utilisent le même modèle et les mêmes outils read-only."
+  ],
+  "scenarios": [
+    {
+      "id": "removed-guard-and-cross-file-contract",
+      "expectedDefects": 2,
+      "baseline": {
+        "expectedDefectsDetected": 2,
+        "additionalValidFindings": 1,
+        "falsePositives": 0,
+        "toolCallCount": 12
+      },
+      "challenger": {
+        "expectedDefectsDetected": 2,
+        "additionalValidFindings": 0,
+        "falsePositives": 0,
+        "toolCallCount": 11
+      },
+      "uniqueChallengerFindings": 0
+    },
+    {
+      "id": "behavior-preserving-refactor",
+      "expectedDefects": 0,
+      "baseline": {
+        "reportedFindings": 0,
+        "falsePositives": 0,
+        "toolCallCount": 5
+      },
+      "challenger": {
+        "reportedFindings": 0,
+        "falsePositives": 0,
+        "toolCallCount": 11
+      },
+      "uniqueChallengerFindings": 0
+    }
+  ],
+  "decision": {
+    "verdict": "reject-skill",
+    "reason": "No unique confirmed finding; the existing review was at least as complete and cheaper on the clean diff.",
+    "retainedIdeas": [
+      "removed invariant reasoning",
+      "cross-file contract tracing"
+    ],
+    "scope": "Corpus limité ; réexaminer une passe seulement si un défaut baseline reproductible apparaît."
+  }
+}

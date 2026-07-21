@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "policy-gate",
+  "fixturePolicy": "Même corpus de seize opérations locales, comparé sans sandbox puis avec attestation Gondolin active.",
+  "baselineWithoutSandbox": {
+    "confirmationCount": 11,
+    "confirmationRate": 0.6875,
+    "headlessBlockCount": 11,
+    "passesThreshold": false
+  },
+  "challengerWithGondolin": {
+    "confirmationCount": 0,
+    "confirmationRate": 0,
+    "headlessBlockCount": 0,
+    "riskDistribution": {
+      "R1": 16
+    },
+    "allAttested": true,
+    "passesThreshold": true
+  },
+  "behavioralProof": {
+    "policyMode": "confirm",
+    "agenticRunCount": 1,
+    "bashToolCalls": 4,
+    "sandboxAttestedResults": 4,
+    "independentNominalPass": true,
+    "independentErrorPass": true,
+    "blockedByPolicy": false
+  },
+  "securityModel": {
+    "attestationRequirements": {
+      "hostMounts": 0,
+      "network": "deny",
+      "activeProbe": true
+    },
+    "inactiveAttestationRestoresOriginalClassification": true,
+    "regexAllowlistExpanded": false,
+    "trustedExtensionBoundary": "Only already-approved extensions can be relied upon; loaded extensions are host-privileged.",
+    "toolOverrideOrdering": "Pi keeps the first tool registered for a duplicate name. Gondolin must therefore be the first extension registering bash; production integration still requires enforcing this composition."
+  },
+  "decision": {
+    "verdict": "challenger-pass",
+    "globalPromotion": "blocked",
+    "remainingGates": [
+      "Unlicense approval",
+      "structured tool routing and reviewed snapshot import/export",
+      "unsandboxed policy mode remains above the friction threshold"
+    ]
+  },
+  "runners": [
+    "scripts/policy-friction-eval.mjs",
+    "scripts/policy-sandbox-friction-eval.mjs",
+    "experiments/gondolin/agent-rpc-e2e.mjs --with-policy"
+  ]
+}

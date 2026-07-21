@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "date": "2026-07-20",
+  "component": "handoff",
+  "valid": false,
+  "providerModel": "openai-codex/gpt-5.6-sol",
+  "dataPolicy": "Code, tests, session et marqueurs entièrement factices ; aucune sortie modèle brute conservée.",
+  "attemptedMethod": {
+    "task": "Synthétiser un patch de parseur depuis chaque forme de transfert.",
+    "modelToolCalls": 0,
+    "runnerBehavior": "Validation du chemin, écriture en workspace jetable, puis exécution node:test sur le code généré."
+  },
+  "observedButInvalidated": {
+    "nativeCompaction": {
+      "contextFacts": 7,
+      "continuationTotalTokens": 20646,
+      "patchAccepted": true,
+      "testsExitedZero": true
+    },
+    "handoff": {
+      "contextFacts": 7,
+      "continuationTotalTokens": 1385,
+      "patchAccepted": true,
+      "testsExitedZero": true
+    }
+  },
+  "invalidation": {
+    "severity": "critical-methodology",
+    "reason": "Le runner a exécuté sur l’hôte du code non fiable produit par le modèle. Un workspace jetable ne bloque ni lecture hors workspace, ni réseau, ni processus externes.",
+    "impact": "Les sorties et codes de test ne peuvent pas servir de preuve de promotion.",
+    "remediation": [
+      "runner supprimé",
+      "commande npm supprimée",
+      "aucune répétition avant sandbox fail-closed",
+      "conserver uniquement la preuve factuelle sans outil"
+    ]
+  },
+  "decision": {
+    "verdict": "invalid-run",
+    "globalPromotion": "blocked",
+    "remainingGate": "Run remplacé par une nouvelle évaluation sandboxée.",
+    "supersededBy": "evals/reports/2026-07-20-gondolin-spike.json"
+  }
+}

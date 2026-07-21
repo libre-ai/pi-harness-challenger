@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "policy-gate",
+  "fixturePolicy": "Seize opérations factices, connues comme locales et réversibles ; aucun chemin personnel ni commande brute persisté.",
+  "result": {
+    "operationCount": 16,
+    "riskDistribution": {
+      "R0": 5,
+      "R1": 0,
+      "R2": 11,
+      "R3": 0
+    },
+    "confirmMode": {
+      "confirmationCount": 11,
+      "confirmationRate": 0.6875,
+      "headlessBlockCount": 11,
+      "acceptanceThreshold": 0.1,
+      "passesAcceptance": false
+    }
+  },
+  "affectedCategories": [
+    "text and file search through shell",
+    "test and lint commands",
+    "local build",
+    "targeted local filesystem mutations",
+    "Git staging"
+  ],
+  "interpretation": {
+    "benefit": "Unknown shell remains fail-closed in restrictive modes.",
+    "cost": "The classifier cannot distinguish known-safe project capabilities from arbitrary scripts and exceeds the friction gate.",
+    "rejectedFix": "Do not broaden regex allowlists for package scripts; they are not a security boundary."
+  },
+  "decision": {
+    "verdict": "lab-only",
+    "globalPromotion": "failed",
+    "remainingGate": "Explicit capability registry plus sandbox/enforcement outside regex classification, then rerun the friction corpus."
+  },
+  "runner": "scripts/policy-friction-eval.mjs"
+}

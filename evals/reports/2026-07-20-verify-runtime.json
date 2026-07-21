@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "verify-runtime",
+  "providerModel": "openai-codex/gpt-5.6-sol",
+  "dataPolicy": "Dépôts, données et identités Git factices ; sorties brutes hors worktree puis supprimées ; rapport agrégé uniquement.",
+  "methodNotes": [
+    "Baseline et challenger ont utilisé le même modèle et les mêmes outils read/bash.",
+    "Un run apparié sans résultat exploitable a été écarté.",
+    "Les commandes runtime et verdicts ont été vérifiés avant suppression des JSONL.",
+    "Tokens et durée n'ont pas été capturés de manière fiable dans cette itération."
+  ],
+  "scenarios": [
+    {
+      "id": "cli-public-bin",
+      "baseline": {
+        "nominal": true,
+        "adjacentProbe": false,
+        "publicInstalledBin": false,
+        "ranTestSuite": true,
+        "bashCallCount": 10
+      },
+      "challenger": {
+        "nominal": true,
+        "adjacentProbe": true,
+        "publicInstalledBin": true,
+        "ranTestSuite": false,
+        "bashCallCount": 7,
+        "verdict": "PASS"
+      }
+    },
+    {
+      "id": "api-local-socket",
+      "baseline": {
+        "nominal": true,
+        "malformedProbe": true,
+        "ranTestSuite": true,
+        "explicitCleanup": true,
+        "bashCallCount": 9,
+        "verdict": "PASS"
+      },
+      "challenger": {
+        "nominal": true,
+        "malformedProbe": true,
+        "ranTestSuite": false,
+        "explicitCleanup": true,
+        "bashCallCount": 6,
+        "verdict": "PASS"
+      },
+      "leftoverServerProcesses": 0
+    },
+    {
+      "id": "documentation-only",
+      "challenger": {
+        "verdict": "SKIP",
+        "reasonPresent": true,
+        "ranTestSuite": false,
+        "bashCallCount": 5
+      }
+    }
+  ],
+  "finding": {
+    "severity": "P2",
+    "description": "La recherche de spécialiste omettait ~/.agents/skills et pouvait manquer verify-portail.",
+    "resolution": "Le skill nomme désormais explicitement les racines de confiance et ~/.agents/skills/verify-portail/."
+  },
+  "decision": {
+    "verdict": "retain-challenger",
+    "demonstratedValue": [
+      "exercises an installed CLI public surface with an adjacent probe",
+      "keeps API runtime verification separate from the test suite",
+      "returns a justified SKIP for documentation-only changes"
+    ],
+    "globalPromotion": "blocked",
+    "remainingGate": "Execute portal delegation to the existing verify-portail skill and capture tokens/duration reproducibly."
+  }
+}

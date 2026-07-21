@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "date": "2026-07-20",
+  "component": "sandbox-b1",
+  "target": "@earendil-works/pi-coding-agent@0.80.10",
+  "finding": "RPC bash calls AgentSession.executeBash without emitting user_bash; absent custom operations, AgentSession selects local host operations.",
+  "artifactEvidence": {
+    "rpcModeDistSha256": "2001c50c4d924f330279ea4cf64e4571c403c7ea7b15797cc0ae170c5d5bf097",
+    "agentSessionDistSha256": "ba869d5d61530cbb2b1653044f470c97da161777c4d5ceb538d03e5f6e713fc8",
+    "interactiveModeDistSha256": "601952fe0a8e87530adad6f58403ce559c303e82bff948b05e9160f2614932f2",
+    "sourceMapContractMatched": true
+  },
+  "minimalPatch": {
+    "path": "experiments/gondolin/upstream/pi-rpc-user-bash.patch",
+    "emitsUserBash": true,
+    "supportsFullReplacementResult": true,
+    "passesCustomOperations": true,
+    "recordsReplacementResult": true,
+    "appliedLocally": false
+  },
+  "residualRisk": {
+    "handlerErrorsCurrentlyAbsorbed": true,
+    "possibleLocalFallbackAfterHandlerError": true,
+    "minimalPatchAloneIsFailClosed": false
+  },
+  "robustProposal": {
+    "rpcShellModes": ["disabled", "required-extension", "local"],
+    "requiredExtensionRejectsMissingHandler": true,
+    "requiredExtensionRejectsHandlerError": true,
+    "localRequiresExplicitOptIn": true
+  },
+  "verification": {
+    "installedArtifactHashMatched": true,
+    "sourceReplacementContractMatched": true,
+    "rpcModeInstallationModified": false,
+    "rpcEntryDeploymentGuardPresent": true,
+    "networkSubmissionPerformed": false
+  },
+  "decision": {
+    "verdict": "proposal-only-not-integrated",
+    "countsAsRuntimeFix": false,
+    "localBoundary": "safe-rpc-launcher.mjs remains required"
+  },
+  "details": "docs/pi-rpc-bash-upstream-proposal.md"
+}

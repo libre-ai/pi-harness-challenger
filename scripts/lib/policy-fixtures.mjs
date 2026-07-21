@@ -1,0 +1,18 @@
+export const LOCAL_REVERSIBLE_COMMAND_FIXTURES = Object.freeze([
+  { id: "working-directory", command: "pwd" },
+  { id: "directory-list", command: "ls -la" },
+  { id: "git-status", command: "git status --short" },
+  { id: "git-diff-stat", command: "git diff --stat" },
+  { id: "git-log", command: "git log -1 --oneline" },
+  { id: "text-search", command: "rg -n TODO src" },
+  { id: "file-search", command: "find src -type f" },
+  { id: "npm-tests", command: "npm test" },
+  { id: "npm-lint", command: "npm run lint" },
+  { id: "node-tests", command: "node --test" },
+  { id: "cargo-tests", command: "cargo test" },
+  { id: "python-tests", command: "python -m pytest" },
+  { id: "local-directory", command: "mkdir -p build/tmp" },
+  { id: "local-copy", command: "cp fixture.txt build/tmp/out.txt" },
+  { id: "git-stage", command: "git add src/file.mjs" },
+  { id: "local-build", command: "npm run build" },
+]);
