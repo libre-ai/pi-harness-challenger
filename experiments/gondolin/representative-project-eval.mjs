@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -10,6 +10,10 @@ import { PiRpcClient } from "../../scripts/lib/pi-rpc.mjs";
 const cwd = resolve(new URL(".", import.meta.url).pathname);
 const projectRoot = resolve(cwd, "../..");
 const launcherPath = join(cwd, "safe-rpc-launcher.mjs");
+const deployedLauncherPath = join(homedir(), ".local", "bin", "pi-gondolin-rpc");
+const argumentsList = process.argv.slice(2);
+assert.ok(argumentsList.length <= 1 && argumentsList.every((argument) => argument === "--deployed"), "usage: representative-project-eval.mjs [--deployed]");
+const useDeployedLauncher = argumentsList.includes("--deployed");
 const allowlist = [
   "extensions/policy-gate/capabilities.mjs",
   "extensions/policy-gate/policy.mjs",
@@ -58,8 +62,8 @@ assert.notEqual(snapshotHashes["extensions/policy-gate/capabilities.mjs"], sourc
 
 const client = new PiRpcClient({
   cwd,
-  executable: process.execPath,
-  executableArgs: [launcherPath],
+  executable: useDeployedLauncher ? deployedLauncherPath : process.execPath,
+  executableArgs: useDeployedLauncher ? [] : [launcherPath],
   environment: {
     PI_GONDOLIN_SNAPSHOT_ROOT: snapshotRoot,
     PI_GONDOLIN_SNAPSHOT_FILES: JSON.stringify(allowlist),
@@ -148,6 +152,8 @@ try {
   process.stdout.write(`${JSON.stringify({
     version: 1,
     backend: "@earendil-works/gondolin@0.12.0",
+    entrypoint: useDeployedLauncher ? "installed-pi-gondolin-rpc" : "source-safe-rpc-launcher",
+    budgets: { maxPromptChars: 100000, maxModelToolCalls: 64, maxSessionDurationMs: 600000 },
     authorizedFileCount: allowlist.length,
     injectedBug: "network-deny-guard-in-temporary-copy",
     preAgentEvaluationPass: false,

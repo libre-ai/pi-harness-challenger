@@ -60,6 +60,9 @@ npm run check:upstream-proposal
 # Tâche sur la liste projet explicitement autorisée, sans application hôte
 npm run eval:representative
 
+# Même tâche via l’entrée pi-gondolin-rpc installée
+node representative-project-eval.mjs --deployed
+
 # Paire compaction native / handoff sur la même liste et la même régression
 npm run eval:representative:handoff
 ```

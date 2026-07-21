@@ -55,7 +55,7 @@ Corriger les faiblesses méthodologiques de A avant d’ajouter de nouvelles cap
    - comportements Rust/Zig préservés.
 5. Ajouter une grille aveugle pour comparer les findings de revue sans afficher leur origine.
 
-Le statut `npm run eval:status` agrège actuellement 30 cas tous évalués : 24 challenger-pass, 3 sans valeur incrémentale, 1 échec courant, 1 run invalidé et 1 preflight supersédé. Il classe sandbox, harness, handoff et verify-runtime `retained-lab`, policy `retained-blocked`, et interdit la promotion du package complet. Le profil Gondolin est déployé et sa promotion de profil est mécaniquement autorisée.
+Le statut `npm run eval:status` agrège actuellement 31 cas tous évalués : 25 challenger-pass, 3 sans valeur incrémentale, 1 échec courant, 1 run invalidé et 1 preflight supersédé. Il classe sandbox, harness, handoff et verify-runtime `retained-lab`, policy `retained-blocked`, et interdit la promotion du package complet. Le profil Gondolin est déployé et sa promotion de profil est mécaniquement autorisée. Un run provider final via l’entrée installée passe avec 11/11 outils attestés, sans écriture hôte.
 
 ### Acceptation
 

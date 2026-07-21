@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "date": "2026-07-21",
+  "component": "sandbox-b1",
+  "gate": "deployed-provider-representative-run",
+  "valid": true,
+  "baselineCommit": "b65b8e9",
+  "runtime": {
+    "backend": "@earendil-works/gondolin@0.12.0",
+    "entrypoint": "installed-pi-gondolin-rpc",
+    "runtimeManifestMatched": true,
+    "budgets": {
+      "maxPromptChars": 100000,
+      "maxModelToolCalls": 64,
+      "maxSessionDurationMs": 600000
+    }
+  },
+  "fixture": {
+    "authorizedFileCount": 4,
+    "injectedBug": "network-deny-guard-in-temporary-copy",
+    "temporaryCopyOnly": true
+  },
+  "result": {
+    "preAgentEvaluationPass": false,
+    "postAgentSuitePass": true,
+    "postAgentIndependentGuardProbePass": true,
+    "toolCallCount": 11,
+    "toolNames": ["bash", "edit", "read"],
+    "sandboxAttestedToolResults": 11,
+    "guestChangedFiles": 1,
+    "durationMs": 30446,
+    "tokens": {
+      "input": 18024,
+      "output": 722,
+      "cacheRead": 46592,
+      "cacheWrite": 0,
+      "total": 65338
+    },
+    "allPass": true
+  },
+  "safety": {
+    "sourceProjectWrites": 0,
+    "temporarySnapshotModelWrites": 0,
+    "hostApplyCalls": 0,
+    "hostCodeExecution": false,
+    "hostMounts": 0,
+    "network": "deny",
+    "rawProviderOutputsRetained": false
+  },
+  "decision": {
+    "verdict": "challenger-pass",
+    "deployedProfileOperational": true,
+    "completePackageGlobalPromotion": "still-blocked-by-unsandboxed-policy-friction"
+  },
+  "runner": "experiments/gondolin/representative-project-eval.mjs --deployed"
+}

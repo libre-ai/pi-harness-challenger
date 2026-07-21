@@ -82,6 +82,7 @@ const gondolinTechnicalCases = [
   "sandbox-gondolin-snapshot-apply",
   "sandbox-gondolin-rpc-launcher",
   "sandbox-gondolin-deployment",
+  "sandbox-gondolin-deployed-provider",
   "sandbox-gondolin-representative-project",
   "handoff-code-gondolin",
   "handoff-representative-gondolin",

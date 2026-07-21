@@ -49,6 +49,7 @@ test("seuls les cas réellement confrontés portent un verdict d’évaluation",
     "sandbox-b1-preflight",
     "sandbox-gondolin-agent-routing",
     "sandbox-gondolin-boundaries",
+    "sandbox-gondolin-deployed-provider",
     "sandbox-gondolin-deployment",
     "sandbox-gondolin-export-preview",
     "sandbox-gondolin-representative-project",
@@ -65,7 +66,7 @@ test("seuls les cas réellement confrontés portent un verdict d’évaluation",
   assert.ok(rejected.every((item) => item.implementationStatus === "rejected"));
 
   const retained = evaluated.filter((item) => item.evaluationStatus === "challenger-pass");
-  assert.equal(retained.length, 24);
+  assert.equal(retained.length, 25);
   assert.ok(retained.every((item) => ["implemented", "existing"].includes(item.implementationStatus)));
 
   const failed = evaluated.filter((item) => item.evaluationStatus === "failed");
