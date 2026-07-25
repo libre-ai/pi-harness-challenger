@@ -1,0 +1,69 @@
+name: CI
+
+# Ce dépôt porte un gate de sécurité (policy-gate : classification R0-R3 des
+# appels d'outil, TTL d'attestation fail-closed). Sa suite tournait jusqu'ici
+# uniquement en local, et rien ne la déclenchait à l'intégration.
+#
+# Périmètre restreint à ce qui s'exécute réellement sur un runner. Deux
+# fichiers de test en sont exclus, pour une raison vérifiée et non par confort :
+#
+#   test/sandbox-preflight.test.mjs — exige le binaire `pi` installé
+#                                     ("Unable to resolve pi executable")
+#   test/eval-status.test.mjs       — assertions sur l'état des rapports
+#                                     d'évaluation de la machine de l'owner
+#
+# 47 des 50 cas tournent ici en ~110 ms. Les 3 autres restent owner-run, comme
+# les smokes de `npm run check` qui demandent une VM Gondolin et un déploiement
+# local attesté. Les inclure produirait un rouge permanent — c'est-à-dire un
+# gate qu'on apprend à ignorer.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Sans ce contrôle, un fichier de test ajouté plus tard ne serait jamais
+      # exécuté ici et personne ne le remarquerait : la CI resterait verte en
+      # couvrant moins. Le job échoue tant que la liste n'est pas remise à jour.
+      - name: The runnable list still covers every test file
+        run: |
+          set -euo pipefail
+          expected="config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills"
+          excluded="eval-status sandbox-preflight"
+          missing=0
+          for f in test/*.test.mjs; do
+            name="$(basename "$f" .test.mjs)"
+            case " $expected $excluded " in
+              *" $name "*) ;;
+              *) echo "NON COUVERT: $f — ajoute-le à la liste, ou aux exclusions avec sa raison"; missing=1 ;;
+            esac
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Tous les fichiers de test sont soit exécutés, soit exclus avec une raison."
+
+      - name: Unit tests
+        run: |
+          node --test \
+            test/config.test.mjs \
+            test/evals.test.mjs \
+            test/extensions-integration.test.mjs \
+            test/gondolin-experiment.test.mjs \
+            test/handoff.test.mjs \
+            test/policy-gate-hardening.test.mjs \
+            test/policy-gate.test.mjs \
+            test/policy-sandbox-friction.test.mjs \
+            test/skills.test.mjs
