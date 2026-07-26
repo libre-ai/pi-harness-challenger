@@ -39,6 +39,7 @@
     "eval:sandbox": "node scripts/sandbox-preflight.mjs",
     "eval:sandbox:licenses": "node scripts/sandbox-license-audit.mjs",
     "eval:status": "node scripts/eval-status.mjs",
-    "check": "npm run test && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
+    "lint:comments": "node scripts/comment-hygiene.mjs",
+    "check": "npm run lint:comments && npm run test && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
   }
 }

@@ -12,7 +12,7 @@ name: CI
 #   test/eval-status.test.mjs       — assertions sur l'état des rapports
 #                                     d'évaluation de la machine de l'owner
 #
-# 47 des 50 cas tournent ici en ~110 ms. Les 3 autres restent owner-run, comme
+# 56 des 59 cas tournent ici en ~125 ms. Les 3 autres restent owner-run, comme
 # les smokes de `npm run check` qui demandent une VM Gondolin et un déploiement
 # local attesté. Les inclure produirait un rouge permanent — c'est-à-dire un
 # gate qu'on apprend à ignorer.
@@ -42,7 +42,7 @@ jobs:
       - name: The runnable list still covers every test file
         run: |
           set -euo pipefail
-          expected="config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills"
+          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills"
           excluded="eval-status sandbox-preflight"
           missing=0
           for f in test/*.test.mjs; do
@@ -55,9 +55,16 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           echo "Tous les fichiers de test sont soit exécutés, soit exclus avec une raison."
 
+      # Ne juge que le mécanisable (code commenté, TODO sans référence, doublon).
+      # Un commentaire faux ou redondant n'est pas détectable ici : cela reste
+      # une revue humaine, et aucun ratio commentaires/code n'est produit.
+      - name: Comment hygiene
+        run: node scripts/comment-hygiene.mjs
+
       - name: Unit tests
         run: |
           node --test \
+            test/comment-hygiene.test.mjs \
             test/config.test.mjs \
             test/evals.test.mjs \
             test/extensions-integration.test.mjs \
