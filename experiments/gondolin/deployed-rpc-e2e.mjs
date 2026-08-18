@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { PiRpcClient } from "../../scripts/lib/pi-rpc.mjs";
 
 const cwd = resolve(new URL(".", import.meta.url).pathname);
-const launcher = join(homedir(), ".local", "bin", "pi-gondolin-rpc");
-const pi = join(homedir(), ".local", "bin", "pi");
-const deploymentState = JSON.parse(readFileSync(join(homedir(), ".local", "share", "pi-harness-challenger", "gondolin-rpc", "deployment.json"), "utf8"));
+const launcher = process.env.PI_GONDOLIN_LAUNCHER ?? join(homedir(), ".local", "bin", "pi-gondolin-rpc");
+const pi = process.env.PI_GONDOLIN_PI ?? join(homedir(), ".local", "bin", "pi");
+const legacyDeploymentRoot = join(homedir(), ".local", "share", "pi-harness-challenger", "gondolin-rpc");
+const deploymentRoot = process.env.PI_GONDOLIN_DEPLOYMENT_ROOT ?? join(legacyDeploymentRoot, "v3");
+let rpcEntryPath = process.env.PI_GONDOLIN_RPC_ENTRY;
+if (!rpcEntryPath && existsSync(join(deploymentRoot, "current"))) {
+  const packageRoot = join(realpathSync(join(deploymentRoot, "current")), "node_modules", "@earendil-works", "pi-coding-agent");
+  rpcEntryPath = join(packageRoot, "dist", "rpc-entry.js");
+}
+if (!rpcEntryPath) {
+  const legacyState = JSON.parse(readFileSync(join(legacyDeploymentRoot, "deployment.json"), "utf8"));
+  rpcEntryPath = legacyState.originalRpcEntry.path;
+}
 const root = mkdtempSync(join(tmpdir(), "gondolin-deployed-rpc-"));
 const snapshotRoot = join(root, "snapshot");
 const canary = join(root, "forbidden-host-write");
@@ -18,10 +28,10 @@ const notifications = [];
 const errors = [];
 let confirmations = 0;
 
-const update = spawnSync(pi, ["update", "pi"], { encoding: "utf8", timeout: 10_000 });
-assert.equal(update.status, 64);
-assert.equal(update.stdout, "");
-assert.equal(update.stderr, "pi-update-requires-gondolin-rollback\n");
+const version = spawnSync(pi, ["--version"], { encoding: "utf8", timeout: 10_000 });
+assert.equal(version.status, 0);
+assert.match(version.stdout.trim(), /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+assert.equal(version.stderr, "");
 const direct = spawnSync(pi, ["--mode", "rpc"], { encoding: "utf8", timeout: 10_000 });
 assert.equal(direct.status, 64);
 assert.equal(direct.stdout, "");
@@ -34,7 +44,7 @@ const forged = spawnSync(pi, ["--mode=rpc"], {
 assert.equal(forged.status, 64);
 assert.equal(forged.stdout, "");
 assert.equal(forged.stderr, "pi-rpc-launcher-required\n");
-const rpcEntry = spawnSync(process.execPath, [deploymentState.originalRpcEntry.path], { encoding: "utf8", timeout: 10_000 });
+const rpcEntry = spawnSync(process.execPath, [rpcEntryPath], { encoding: "utf8", timeout: 10_000 });
 assert.equal(rpcEntry.status, 64);
 assert.equal(rpcEntry.stdout, "");
 assert.equal(rpcEntry.stderr, "pi-rpc-launcher-required\n");

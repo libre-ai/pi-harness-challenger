@@ -25,12 +25,19 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "test:transactional:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/release-manager.mjs --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=95 test/transactional-updater.test.mjs",
     "smoke": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./extensions/policy-gate/index.mjs -e ./extensions/handoff/index.mjs --list-models __challenger_smoke__",
     "smoke:skills": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --skill ./skills --list-models __challenger_skills_smoke__",
     "smoke:rpc": "node experiments/gondolin/deployed-rpc-e2e.mjs",
     "smoke:budgets": "node experiments/gondolin/budget-test.mjs",
-    "deployment:status": "node experiments/gondolin/deploy-local.mjs status",
-    "deployment:rollback": "node experiments/gondolin/deploy-local.mjs rollback",
+    "deployment:status": "node experiments/gondolin/update-local.mjs status",
+    "deployment:rollback": "node experiments/gondolin/update-local.mjs rollback",
+    "transactional:install": "node experiments/gondolin/update-local.mjs install",
+    "transactional:status": "node experiments/gondolin/update-local.mjs status",
+    "transactional:update": "node experiments/gondolin/update-local.mjs update",
+    "transactional:rollback": "node experiments/gondolin/update-local.mjs rollback",
+    "transactional:automation:enable": "node experiments/gondolin/update-local.mjs automation-enable",
+    "transactional:automation:disable": "node experiments/gondolin/update-local.mjs automation-disable",
     "eval:handoff": "node scripts/handoff-quality-eval.mjs",
     "eval:handoff:continuation": "node scripts/handoff-quality-eval.mjs --continuation",
     "eval:policy": "node scripts/policy-friction-eval.mjs",
@@ -40,6 +47,6 @@
     "eval:sandbox:licenses": "node scripts/sandbox-license-audit.mjs",
     "eval:status": "node scripts/eval-status.mjs",
     "lint:comments": "node scripts/comment-hygiene.mjs",
-    "check": "npm run lint:comments && npm run test && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
+    "check": "npm run lint:comments && npm run test && npm run test:transactional:coverage && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
   }
 }

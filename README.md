@@ -139,11 +139,18 @@ npm run eval:sandbox:licenses
 # Offline : agrège verdicts, preuves et gates de promotion
 npm run eval:status
 
-# Vérifie le déploiement RPC local et ses empreintes
+# Vérifie le déploiement transactionnel, la release active et ses empreintes
 npm run deployment:status
 
-# Retrait atomique du profil RPC déployé
+# Met à jour Pi via candidate isolée + gates Gondolin
+pi update
+
+# Revient atomiquement à la release Pi qualifiée précédente
 npm run deployment:rollback
+
+# Active ou retire la vérification automatique launchd
+npm run transactional:automation:enable
+npm run transactional:automation:disable
 ```
 
 Les smoke tests non-RPC chargent explicitement les extensions et le skill avec les autres ressources désactivées. Le smoke RPC passe exclusivement par l’entrée `pi-gondolin-rpc` installée : il refuse la commande RPC native `bash`, confirme l’import du snapshot et vérifie l’absence d’écriture hôte, sans provider.
@@ -160,7 +167,19 @@ pi --no-extensions -e ./extensions/policy-gate/index.mjs
 
 ## Déploiement local
 
-Le profil RPC Gondolin est déployé sans ajouter les extensions challenger à `settings.json`. `pi --mode rpc` direct et l’export `rpc-entry` sont refusés ; `pi-gondolin-rpc` exige une racine et une allowlist de snapshot. Le déploiement borne chaque prompt à 100 000 caractères, chaque session à 64 appels d’outils et 10 minutes. Il est hash-pinné et réversible avec `npm run deployment:rollback`. `pi update` est refusé tant que le profil est actif afin d’éviter de remplacer silencieusement l’artefact gardé.
+Le profil RPC Gondolin est déployé sans ajouter les extensions challenger à `settings.json`. `pi --mode rpc` direct et l’export `rpc-entry` sont refusés ; `pi-gondolin-rpc` exige une racine et une allowlist de snapshot. Le déploiement borne chaque prompt à 100 000 caractères, chaque session à 64 appels d’outils et 10 minutes.
+
+La migration initiale s’exécute depuis un profil v2 vert :
+
+```bash
+npm run transactional:install
+pi update
+npm run transactional:automation:enable
+```
+
+Depuis le profil v3, `pi update` installe la version cible dans une candidate privée, vérifie l’intégrité npm et les licences, rejoue les gates CLI/RPC/Gondolin, puis bascule `current` atomiquement. `previous` reste disponible pour `npm run deployment:rollback`. Une candidate incompatible reste bloquée sans modifier la release active ; `pi update --force` permet une requalification explicite après évolution du contrôleur. Le runtime déployé est copié et manifesté : le checkout source peut être retiré sans casser Pi.
+
+L’agent utilisateur `launchd` optionnel exécute le même contrôle au chargement puis toutes les heures. Il ne promeut que les versions compatibles et persiste uniquement l’identifiant agrégé d’une release bloquée. Voir [ADR-0001](./docs/adr-0001-transactional-pi-updates.md).
 
 ## Activation globale du package complet
 
