@@ -111,7 +111,8 @@ function staticDeploymentFixture({
   const piWrapper = join(root, "pi");
   const launcherWrapper = join(root, "pi-gondolin-rpc");
   const markerPath = join(temporary.root, "execution-marker");
-  const bindingId = `node-${nodeVersion.slice(1)}-${sha256Text(`${canonicalNodePath}\0${nodeVersion}`).slice(0, 12)}`;
+  const qualifiedAt = "2026-09-09T00:00:00.000Z";
+  const bindingId = `node-${nodeVersion.slice(1)}-${sha256Text(`${canonicalNodePath}\0${nodeVersion}\0${qualifiedAt}`).slice(0, 12)}`;
   const bindingRoot = join(root, "node-bindings", bindingId);
 
   mkdirSync(dirname(controllerPath), { recursive: true, mode: 0o700 });
@@ -150,7 +151,7 @@ function staticDeploymentFixture({
     bindingId,
     canonicalNodePath,
     nodeVersion,
-    qualifiedAt: "2026-09-09T00:00:00.000Z",
+    qualifiedAt,
     recoverySource: "homebrew",
   }, null, 2)}\n`;
   if (runtimeBinding) {

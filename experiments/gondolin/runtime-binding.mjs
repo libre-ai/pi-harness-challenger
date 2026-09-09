@@ -121,9 +121,9 @@ function requireBindingSource(source) {
   return source;
 }
 
-function bindingIdFor(canonicalNodePath, nodeVersion) {
+function bindingIdFor(canonicalNodePath, nodeVersion, qualifiedAt) {
   const normalizedVersion = nodeVersion.slice(1);
-  const digest = sha256(`${canonicalNodePath}\0${nodeVersion}`).slice(0, 12);
+  const digest = sha256(`${canonicalNodePath}\0${nodeVersion}\0${qualifiedAt}`).slice(0, 12);
   return `node-${normalizedVersion}-${digest}`;
 }
 
@@ -164,8 +164,11 @@ function inspectBindingRoot(bindingRoot, { active, requireExecutable }) {
   if (metadata.runtimeBindingVersion !== RUNTIME_BINDING_VERSION
     || metadata.canonicalNodePath !== canonicalNodePath
     || !BINDING_ID_PATTERN.test(metadata.bindingId)
-    || metadata.bindingId !== bindingIdFor(canonicalNodePath, requireNodeVersion(metadata.nodeVersion))
-    || requireQualifiedAt(metadata.qualifiedAt) !== metadata.qualifiedAt
+    || metadata.bindingId !== bindingIdFor(
+      canonicalNodePath,
+      requireNodeVersion(metadata.nodeVersion),
+      requireQualifiedAt(metadata.qualifiedAt),
+    )
     || requireBindingSource(metadata.recoverySource) !== metadata.recoverySource) {
     throw new Error("node-runtime-binding-metadata-invalid");
   }
@@ -217,7 +220,7 @@ export async function promoteRuntimeBinding({
 
   const bindingsRoot = join(deploymentRoot, "node-bindings");
   ensurePrivateDirectory(bindingsRoot);
-  const bindingId = bindingIdFor(canonicalNodePath, nodeVersion);
+  const bindingId = bindingIdFor(canonicalNodePath, nodeVersion, qualifiedAt);
   const finalBindingRoot = join(bindingsRoot, bindingId);
   if (existsSync(finalBindingRoot)) throw new Error("node-runtime-binding-exists");
   const candidateRoot = join(bindingsRoot, `.candidate-${process.pid}-${randomUUID()}`);

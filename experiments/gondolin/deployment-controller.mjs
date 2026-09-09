@@ -700,11 +700,12 @@ function writeDeploymentWrappers(stagingRoot, finalRoot, nodePath, nodeRecoveryP
   );
 }
 
-function postActivationSmoke(paths, expectedVersion) {
-  const version = run(paths.piWrapper, ["--version"], { env: qualificationEnvironment(), timeout: 10_000 });
-  const direct = run(paths.piWrapper, ["--mode", "rpc"], { timeout: 10_000 });
+function postActivationSmoke(paths, expectedVersion, environment = process.env) {
+  const smokeEnvironment = qualificationEnvironment({}, environment);
+  const version = run(paths.piWrapper, ["--version"], { env: smokeEnvironment, timeout: 10_000 });
+  const direct = run(paths.piWrapper, ["--mode", "rpc"], { env: smokeEnvironment, timeout: 10_000 });
   const incomplete = run(paths.launcherWrapper, [], {
-    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_GONDOLIN_"))),
+    env: Object.fromEntries(Object.entries(smokeEnvironment).filter(([key]) => !key.startsWith("PI_GONDOLIN_"))),
     timeout: 10_000,
   });
   return resultPassed(version)
@@ -997,9 +998,11 @@ export async function adoptRuntimeBindingV3({
   const workRoot = join(paths.deploymentRoot, `.adoption-candidate-${process.pid}-${randomUUID()}`);
   let journalStarted = false;
   try {
+    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
+    const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const activationGate = postActivationGate ?? (() => {
       const { release } = stateAndCurrent(paths);
-      return postActivationSmoke(paths, release.packageVersion);
+      return postActivationSmoke(paths, release.packageVersion, environment);
     });
     const recovered = await recoverAdoption(paths, activationGate);
     if (recovered === "completed") {
@@ -1054,8 +1057,6 @@ export async function adoptRuntimeBindingV3({
     writeOwnedJson(join(stagedRoot, "deployment.json"), nextState);
     const bindingDeploymentRoot = join(workRoot, "binding");
     ensureOwnedDirectory(bindingDeploymentRoot);
-    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
-    const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const gate = qualificationGate ?? ((context) => qualifyRelease({
       deploymentRoot: paths.deploymentRoot,
       releaseRoot: context.releaseRoot,
@@ -1202,9 +1203,12 @@ export async function installV3({
     linksSwitched = true;
     atomicSymlink(paths.piWrapper, paths.installedPi);
     atomicSymlink(paths.launcherWrapper, paths.installedLauncher);
-    if (!postActivationSmoke(paths, migrated.release.version)) throw new Error("migration-post-activation-refused");
+    const deployedEnvironment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
+    if (!postActivationSmoke(paths, migrated.release.version, deployedEnvironment)) {
+      throw new Error("migration-post-activation-refused");
+    }
     const e2e = run(state.nodePath, [join(paths.deploymentRoot, "controller", "runtime", "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
-      env: qualificationEnvironment({ PI_GONDOLIN_DEPLOYMENT_ROOT: paths.deploymentRoot }),
+      env: qualificationEnvironment({ PI_GONDOLIN_DEPLOYMENT_ROOT: paths.deploymentRoot }, deployedEnvironment),
       timeout: 240_000,
     });
     if (!resultPassed(e2e)) throw new Error("migration-deployed-e2e-refused");
@@ -1565,6 +1569,8 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
   let state;
   let attemptedReleaseId;
   try {
+    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
+    const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const status = deploymentStatusV3({ home, deploymentRoot: overrideRoot });
     if (!status.deployed) throw new Error("deployment-pre-update-invalid");
     const current = stateAndCurrent(paths);
@@ -1593,6 +1599,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
         releaseRoot: currentRoot,
         nodePath: state.nodePath,
         launcherPath: paths.launcherPath,
+        environment,
       })) throw new Error("current-release-requalification-refused");
       updateExtensionsIfRequested(paths, updateExtensions);
       return { updated: false, currentVersion: release.version, reason: "requalified-current" };
@@ -1615,10 +1622,11 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
             releaseRoot: path,
             nodePath: state.nodePath,
             launcherPath: paths.launcherPath,
+            environment,
           }),
         },
       ],
-      postActivationGate: async () => postActivationSmoke(paths, release.version),
+      postActivationGate: async () => postActivationSmoke(paths, release.version, environment),
     });
     const previousRelease = state.currentRelease;
     state.currentRelease = releaseId;
@@ -1652,11 +1660,13 @@ export function rollbackV3({ home, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
   try {
+    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
+    const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const { state } = stateAndCurrent(paths);
     const result = rollbackRelease(paths.deploymentRoot);
     const currentRoot = currentReleaseRoot(paths.deploymentRoot);
     const current = readReleaseMetadata(currentRoot);
-    if (!postActivationSmoke(paths, current.packageVersion)) {
+    if (!postActivationSmoke(paths, current.packageVersion, environment)) {
       rollbackRelease(paths.deploymentRoot);
       throw new Error("rollback-post-activation-refused");
     }

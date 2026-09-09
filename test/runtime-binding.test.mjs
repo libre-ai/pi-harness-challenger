@@ -314,18 +314,25 @@ test("a broken historical binding remains inspectable but cannot execute", async
   }
 });
 
-test("a qualified binding identifier cannot be reused", async () => {
+test("the same Homebrew runtime can be requalified as a distinct immutable generation", async () => {
   const fixture = await activeBindingFixture();
   try {
+    const previousBindingId = fixture.binding.bindingId;
+    const nextInput = {
+      deploymentRoot: fixture.root,
+      canonicalNodePath: fixture.nodePath,
+      nodeVersion: "v26.8.1",
+      qualifiedAt: "2026-09-10T12:00:00.000Z",
+      source: "homebrew-recovery",
+      qualificationGate: async () => true,
+    };
+    const next = await promoteRuntimeBinding(nextInput);
+
+    assert.notEqual(next.bindingId, previousBindingId);
+    assert.equal(existsSync(join(fixture.root, "node-bindings", previousBindingId)), true);
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), `node-bindings/${next.bindingId}`);
     await assert.rejects(
-      promoteRuntimeBinding({
-        deploymentRoot: fixture.root,
-        canonicalNodePath: fixture.nodePath,
-        nodeVersion: "v26.8.1",
-        qualifiedAt: "2026-09-10T12:00:00.000Z",
-        source: "homebrew-recovery",
-        qualificationGate: async () => true,
-      }),
+      promoteRuntimeBinding(nextInput),
       /node-runtime-binding-exists/,
     );
   } finally {
