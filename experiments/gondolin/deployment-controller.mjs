@@ -278,8 +278,7 @@ function currentReleaseRoot(deploymentRoot) {
   return releaseRoot;
 }
 
-export function renderLaunchAgentPlist({ home, deploymentRoot, nodePath, qemuPath = "/opt/homebrew/bin/qemu-system-aarch64" }) {
-  const updaterPath = join(deploymentRoot, "controller", "update-local.mjs");
+export function renderLaunchAgentPlist({ home, deploymentRoot, piWrapperPath, qemuPath = "/opt/homebrew/bin/qemu-system-aarch64" }) {
   const executablePath = `${dirname(qemuPath)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -289,8 +288,7 @@ export function renderLaunchAgentPlist({ home, deploymentRoot, nodePath, qemuPat
   <string>${LAUNCH_AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xmlEscape(nodePath)}</string>
-    <string>${xmlEscape(updaterPath)}</string>
+    <string>${xmlEscape(piWrapperPath)}</string>
     <string>update</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -317,17 +315,28 @@ export function renderLaunchAgentPlist({ home, deploymentRoot, nodePath, qemuPat
 `;
 }
 
-function stablePiWrapper({ deploymentRoot, nodePath, launcherPath }) {
+export function renderStablePiWrapper({ deploymentRoot, nodePath, nodeRecoveryPath, launcherPath }) {
   return `#!/bin/sh
 set -eu
 ROOT=${shellQuote(deploymentRoot)}
 NODE=${shellQuote(nodePath)}
+RECOVERY_NODE=${shellQuote(nodeRecoveryPath)}
 LAUNCHER=${shellQuote(launcherPath)}
 refuse() { printf '%s\\n' 'pi-gondolin-deployment-integrity-refused' >&2; exit 65; }
 (
   cd "$ROOT"
   /usr/bin/shasum -a 256 -c controller.sha256 >/dev/null 2>&1
 ) || refuse
+if [ ! -x "$NODE" ]; then
+  [ -n "\${HOME-}" ] && [ -x "$RECOVERY_NODE" ] || refuse
+  /usr/bin/env -i \\
+    HOME="$HOME" \\
+    PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' \\
+    PI_GONDOLIN_DEPLOYMENT_ROOT="$ROOT" \\
+    TMPDIR="$ROOT/tmp" \\
+    "$RECOVERY_NODE" "$ROOT/controller/update-local.mjs" runtime-repin >/dev/null 2>&1 || refuse
+  [ -x "$NODE" ] || refuse
+fi
 if [ "\${1-}" = "update" ]; then
   export PI_GONDOLIN_DEPLOYMENT_ROOT="$ROOT"
   exec "$NODE" "$ROOT/controller/update-local.mjs" route "$@"
@@ -366,11 +375,12 @@ exec "$NODE" "$REAL_PI" "$@"
 `;
 }
 
-function stableLauncherWrapper({ deploymentRoot, nodePath, launcherPath }) {
+export function renderStableLauncherWrapper({ deploymentRoot, nodePath, nodeRecoveryPath, launcherPath }) {
   return `#!/bin/sh
 set -eu
 ROOT=${shellQuote(deploymentRoot)}
 NODE=${shellQuote(nodePath)}
+RECOVERY_NODE=${shellQuote(nodeRecoveryPath)}
 LAUNCHER=${shellQuote(launcherPath)}
 refuse() { printf '%s\\n' 'gondolin-rpc-deployment-integrity-refused' >&2; exit 65; }
 (
@@ -378,6 +388,16 @@ refuse() { printf '%s\\n' 'gondolin-rpc-deployment-integrity-refused' >&2; exit 
   /usr/bin/shasum -a 256 -c controller.sha256 >/dev/null 2>&1
   /usr/bin/shasum -a 256 -c runtime.sha256 >/dev/null 2>&1
 ) || refuse
+if [ ! -x "$NODE" ]; then
+  [ -n "\${HOME-}" ] && [ -x "$RECOVERY_NODE" ] || refuse
+  /usr/bin/env -i \\
+    HOME="$HOME" \\
+    PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' \\
+    PI_GONDOLIN_DEPLOYMENT_ROOT="$ROOT" \\
+    TMPDIR="$ROOT/tmp" \\
+    "$RECOVERY_NODE" "$ROOT/controller/update-local.mjs" runtime-repin >/dev/null 2>&1 || refuse
+  [ -x "$NODE" ] || refuse
+fi
 TARGET=$(/usr/bin/readlink "$ROOT/current") || refuse
 case "$TARGET" in releases/*) ;; *) refuse ;; esac
 case "$TARGET" in *..*|*\\\\*|*"\n"*) refuse ;; esac
@@ -634,12 +654,16 @@ function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath })
   }
 }
 
-function writeDeploymentWrappers(stagingRoot, finalRoot, nodePath) {
+function writeDeploymentWrappers(stagingRoot, finalRoot, nodePath, nodeRecoveryPath) {
   const launcherPath = join(finalRoot, "controller", "runtime", "experiments", "gondolin", "safe-rpc-launcher.mjs");
-  atomicWrite(join(stagingRoot, "pi"), stablePiWrapper({ deploymentRoot: finalRoot, nodePath, launcherPath }), 0o700);
+  atomicWrite(
+    join(stagingRoot, "pi"),
+    renderStablePiWrapper({ deploymentRoot: finalRoot, nodePath, nodeRecoveryPath, launcherPath }),
+    0o700,
+  );
   atomicWrite(
     join(stagingRoot, "pi-gondolin-rpc"),
-    stableLauncherWrapper({ deploymentRoot: finalRoot, nodePath, launcherPath }),
+    renderStableLauncherWrapper({ deploymentRoot: finalRoot, nodePath, nodeRecoveryPath, launcherPath }),
     0o700,
   );
 }
@@ -809,7 +833,7 @@ export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot })
     const plist = renderLaunchAgentPlist({
       home,
       deploymentRoot: paths.deploymentRoot,
-      nodePath: state.nodePath,
+      piWrapperPath: paths.piWrapper,
       qemuPath: state.qemuPath,
     });
     atomicWrite(paths.launchAgentPath, plist);

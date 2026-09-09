@@ -7,6 +7,8 @@ import test from "node:test";
 import {
   auditPiPackageLicenses,
   renderLaunchAgentPlist,
+  renderStableLauncherWrapper,
+  renderStablePiWrapper,
   verifyCandidatePackage,
 } from "../experiments/gondolin/deployment-controller.mjs";
 import {
@@ -151,15 +153,60 @@ test("le job launchd appelle uniquement le contrôleur déployé avec des sortie
   const plist = renderLaunchAgentPlist({
     home: "/Users/test&user",
     deploymentRoot: "/Users/test&user/.local/share/pi<guard>",
-    nodePath: "/opt/node/bin/node",
+    piWrapperPath: "/Users/test&user/.local/share/pi<guard>/pi",
   });
   assert.match(plist, /dev\.pi-gondolin\.transactional-update/);
-  assert.match(plist, /\/opt\/node\/bin\/node/);
-  assert.match(plist, /update-local\.mjs/);
+  assert.match(plist, /pi&lt;guard&gt;\/pi/);
+  assert.doesNotMatch(plist, /\/opt\/node\/bin\/node/);
+  assert.doesNotMatch(plist, /update-local\.mjs/);
   assert.match(plist, /<string>update<\/string>/);
   assert.match(plist, /\/dev\/null/);
   assert.match(plist, /test&amp;user/);
   assert.match(plist, /pi&lt;guard&gt;/);
+  assert.doesNotMatch(plist, /StandardOutPath>[\s\S]*\.log/);
+});
+
+test("les wrappers stables réparent seulement un binding Node cassé", () => {
+  const deploymentRoot = "/Users/test/deployment";
+  const nodePath = `${deploymentRoot}/node-current/node`;
+  const nodeRecoveryPath = "/opt/homebrew/opt/node/bin/node";
+  const launcherPath = `${deploymentRoot}/controller/runtime/experiments/gondolin/safe-rpc-launcher.mjs`;
+  const piWrapper = renderStablePiWrapper({
+    deploymentRoot,
+    nodePath,
+    nodeRecoveryPath,
+    launcherPath,
+  });
+  const launcherWrapper = renderStableLauncherWrapper({
+    deploymentRoot,
+    nodePath,
+    nodeRecoveryPath,
+    launcherPath,
+  });
+
+  for (const wrapper of [piWrapper, launcherWrapper]) {
+    assert.match(wrapper, /NODE='\/Users\/test\/deployment\/node-current\/node'/);
+    assert.match(wrapper, /RECOVERY_NODE='\/opt\/homebrew\/opt\/node\/bin\/node'/);
+    assert.match(wrapper, /if \[ ! -x "\$NODE" \]; then/);
+    assert.match(wrapper, /\/usr\/bin\/env -i/);
+    assert.match(wrapper, /runtime-repin/);
+    assert.doesNotMatch(wrapper, /Cellar\/node/);
+    assert.doesNotMatch(wrapper, /OPENAI_API_KEY|ANTHROPIC_API_KEY/);
+  }
+  assert.equal((piWrapper.match(/controller\.sha256/g) ?? []).length, 1);
+  assert.equal((launcherWrapper.match(/controller\.sha256/g) ?? []).length, 1);
+});
+
+test("launchd réutilise le wrapper Pi stable sans pinner Node", () => {
+  const plist = renderLaunchAgentPlist({
+    home: "/Users/test&user",
+    deploymentRoot: "/Users/test&user/.local/share/pi<guard>",
+    piWrapperPath: "/Users/test&user/.local/share/pi<guard>/pi",
+  });
+
+  assert.match(plist, /<string>\/Users\/test&amp;user\/\.local\/share\/pi&lt;guard&gt;\/pi<\/string>/);
+  assert.match(plist, /<string>update<\/string>/);
+  assert.doesNotMatch(plist, /Cellar\/node|opt\/node\/bin\/node|update-local\.mjs/);
   assert.doesNotMatch(plist, /StandardOutPath>[\s\S]*\.log/);
 });
 
