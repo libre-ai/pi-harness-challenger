@@ -56,3 +56,34 @@ A `launchd` user agent checks hourly and at load. It runs the same updater, writ
 - In-place update followed by new hashes: no atomic rollback and a compatibility claim without evidence.
 - Removing Pi hashes from the wrapper: weakens the guarded RPC boundary.
 - Keeping all updates manual: safer than blind updates but does not satisfy automatic compatible promotion.
+
+## Amendment — qualified Node runtime bindings (2026-09-09)
+
+Normal execution resolves `node-current/node`. `node-current` selects one immutable,
+qualified binding generation whose inner link records the exact canonical Node
+executable. A runtime promotion changes one symlink atomically; it does not rewrite
+the Pi release, stable wrappers, or launchd job. Previous binding generations remain
+as private audit evidence. Their metadata records only the binding identifier,
+canonical Homebrew keg path, Node version, qualification timestamp, and recovery
+source—never prompts, commands, project paths, credentials, or user identifiers.
+
+Homebrew is the explicit interpreter-provenance authority. Recovery accepts only the
+fixed Apple Silicon or Intel Homebrew `opt/node/bin/node` anchor resolving to the
+controller's own canonical executable. It never searches `PATH`, accepts an executable
+from argv, or falls back to another runtime. Before switching, the controller verifies
+the deployed manifests and current release, then runs the existing offline CLI, RPC,
+license, budget, sandbox, and E2E qualification gates under an allowlisted environment
+without provider credentials or caller project state. This restriction limits what is
+exposed to the candidate; it is not a sandbox against a malicious Homebrew interpreter.
+
+Stable wrappers attempt recovery only when the active exact binding is not executable.
+A healthy binding, unsupported installation layout, recovery-anchor mismatch, malformed
+private state, or failed qualification is refused. Runtime recovery never fetches or
+promotes a Pi release.
+
+Adopting an older direct-path v3 deployment is a staged, crash-recoverable transaction,
+not a falsely claimed single-operation atomic update. A private, fsynced journal covers
+the controller, wrappers, deployment state, and optional launchd plist. Recovery either
+restores fixed-name backups or finishes binding activation and post-activation smoke.
+The Pi release directories and the `current`/`previous` release links are outside this
+replacement set and remain unchanged.
