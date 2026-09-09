@@ -44,7 +44,7 @@ jobs:
       - name: The runnable list still covers every test file
         run: |
           set -euo pipefail
-          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction runtime-adoption runtime-binding skills transactional-updater"
+          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction release-transaction runtime-adoption runtime-binding skills transactional-updater"
           excluded="eval-status sandbox-preflight"
           missing=0
           for f in test/*.test.mjs; do
@@ -75,6 +75,7 @@ jobs:
             test/policy-gate-hardening.test.mjs \
             test/policy-gate.test.mjs \
             test/policy-sandbox-friction.test.mjs \
+            test/release-transaction.test.mjs \
             test/runtime-adoption.test.mjs \
             test/runtime-binding.test.mjs \
             test/skills.test.mjs \
@@ -85,3 +86,6 @@ jobs:
 
       - name: Runtime lifecycle coverage gate
         run: npm run test:runtime-lifecycle:coverage
+
+      - name: Release transaction coverage gate
+        run: npm run test:release-transaction:coverage
