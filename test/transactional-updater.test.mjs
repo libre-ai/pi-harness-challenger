@@ -1,16 +1,39 @@
 import assert from "node:assert/strict";
-import { lstatSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   auditPiPackageLicenses,
+  deploymentStaticStatusV3,
   renderLaunchAgentPlist,
   renderStableLauncherWrapper,
   renderStablePiWrapper,
+  runtimeRepinV3,
   verifyCandidatePackage,
 } from "../experiments/gondolin/deployment-controller.mjs";
+import {
+  homebrewRecoveryAnchor,
+  inspectRuntimeBinding,
+} from "../experiments/gondolin/runtime-binding.mjs";
 import {
   acquireUpdateLock,
   buildCriticalManifest,
@@ -31,6 +54,336 @@ function temporaryRoot(prefix) {
 function resolvedLink(path) {
   return readlinkSync(path);
 }
+
+function sha256Text(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function staticDeploymentFixture({
+  canonicalNodePath = "/opt/homebrew/Cellar/node/0.0.0-missing/bin/node",
+  nodeVersion = "v0.0.0",
+} = {}) {
+  const temporary = temporaryRoot("pi-static-deployment-");
+  const root = join(temporary.root, "deployment");
+  const home = join(temporary.root, "home");
+  const releaseId = "0.84.2-test";
+  const releaseRoot = join(root, "releases", releaseId);
+  const controllerPath = join(root, "controller", "deployment-controller.mjs");
+  const runtimePath = join(root, "controller", "runtime", "runtime-entry.mjs");
+  const piWrapper = join(root, "pi");
+  const launcherWrapper = join(root, "pi-gondolin-rpc");
+  const markerPath = join(temporary.root, "execution-marker");
+  const bindingId = `node-${nodeVersion.slice(1)}-${sha256Text(`${canonicalNodePath}\0${nodeVersion}`).slice(0, 12)}`;
+  const bindingRoot = join(root, "node-bindings", bindingId);
+
+  mkdirSync(dirname(controllerPath), { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(runtimePath), { recursive: true, mode: 0o700 });
+  mkdirSync(releaseRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(bindingRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".local", "bin"), { recursive: true, mode: 0o700 });
+  writeFileSync(controllerPath, "controller\n", { mode: 0o600 });
+  writeFileSync(runtimePath, "runtime\n", { mode: 0o600 });
+  buildCriticalManifest(root, ["controller/deployment-controller.mjs"], join(root, "controller.sha256"));
+  buildCriticalManifest(root, ["controller/runtime/runtime-entry.mjs"], join(root, "runtime.sha256"));
+
+  const releaseMetadata = `${JSON.stringify({
+    version: 1,
+    packageName: "@earendil-works/pi-coding-agent",
+    packageVersion: "0.84.2",
+    integrity: "sha512-test",
+    source: "test",
+  }, null, 2)}\n`;
+  writeFileSync(join(releaseRoot, "release.json"), releaseMetadata, { mode: 0o600 });
+  buildCriticalManifest(releaseRoot, ["release.json"], join(releaseRoot, "critical.sha256"));
+  symlinkSync(`releases/${releaseId}`, join(root, "current"));
+
+  const instrumentedWrapper = `#!/bin/sh\nprintf invoked > ${markerPath}\nexit 64\n`;
+  writeFileSync(piWrapper, instrumentedWrapper, { mode: 0o700 });
+  writeFileSync(launcherWrapper, instrumentedWrapper, { mode: 0o700 });
+  symlinkSync(piWrapper, join(home, ".local", "bin", "pi"));
+  symlinkSync(launcherWrapper, join(home, ".local", "bin", "pi-gondolin-rpc"));
+
+  const bindingMetadata = `${JSON.stringify({
+    runtimeBindingVersion: 1,
+    bindingId,
+    canonicalNodePath,
+    nodeVersion,
+    qualifiedAt: "2026-09-09T00:00:00.000Z",
+    recoverySource: "homebrew",
+  }, null, 2)}\n`;
+  writeFileSync(join(bindingRoot, "binding.json"), bindingMetadata, { mode: 0o400 });
+  symlinkSync(canonicalNodePath, join(bindingRoot, "node"));
+  writeFileSync(
+    join(bindingRoot, "binding.sha256"),
+    `${sha256Text(bindingMetadata)}  binding.json\n${sha256Text(canonicalNodePath)}  node.target\n`,
+    { mode: 0o400 },
+  );
+  chmodSync(bindingRoot, 0o500);
+  symlinkSync(`node-bindings/${bindingId}`, join(root, "node-current"));
+
+  const nodePath = join(root, "node-current", "node");
+  const state = {
+    version: 3,
+    profile: "gondolin-rpc-transactional-releases",
+    runtimeBindingVersion: 1,
+    nodePath,
+    nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
+    npmCommand: [nodePath, "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"],
+    qemuPath: "/opt/homebrew/bin/qemu-system-aarch64",
+    packageName: "@earendil-works/pi-coding-agent",
+    currentRelease: releaseId,
+    previousRelease: null,
+    wrappers: {
+      piSha256: sha256Text(instrumentedWrapper),
+      launcherSha256: sha256Text(instrumentedWrapper),
+    },
+  };
+  writeFileSync(join(root, "deployment.json"), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+
+  return {
+    root,
+    home,
+    paths: {
+      bindingManifest: join(bindingRoot, "binding.sha256"),
+      controllerPath,
+      current: join(root, "current"),
+      installedPi: join(home, ".local", "bin", "pi"),
+      piWrapper,
+      releaseMetadata: join(releaseRoot, "release.json"),
+      runtimePath,
+      statePath: join(root, "deployment.json"),
+    },
+    executionCount: () => existsSync(markerPath) ? 1 : 0,
+    cleanup: () => {
+      for (const entry of readdirSync(join(root, "node-bindings"))) {
+        chmodSync(join(root, "node-bindings", entry), 0o700);
+      }
+      temporary.cleanup();
+    },
+  };
+}
+
+test("static deployment validation accepts a missing qualified runtime without executing it", () => {
+  const fixture = staticDeploymentFixture();
+  try {
+    const status = deploymentStaticStatusV3({ home: fixture.home, deploymentRoot: fixture.root });
+    assert.equal(status.staticIntegrityPassed, true);
+    assert.equal(status.runtimeExecutable, false);
+    assert.equal(fixture.executionCount(), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("static deployment validation fails closed for every critical integrity class", async (t) => {
+  const mutations = [
+    ["controller manifest", ({ controllerPath }) => writeFileSync(controllerPath, "tampered\n")],
+    ["runtime manifest", ({ runtimePath }) => writeFileSync(runtimePath, "tampered\n")],
+    ["release manifest", ({ releaseMetadata }) => writeFileSync(releaseMetadata, "{}\n")],
+    ["wrapper hash", ({ piWrapper }) => writeFileSync(piWrapper, "#!/bin/sh\nexit 0\n")],
+    ["binding manifest", ({ bindingManifest }) => {
+      chmodSync(bindingManifest, 0o600);
+      writeFileSync(bindingManifest, "invalid\n");
+    }],
+    ["installed link", ({ installedPi }) => {
+      rmSync(installedPi);
+      symlinkSync("/missing/pi", installedPi);
+    }],
+    ["current release link", ({ current }) => {
+      rmSync(current);
+      symlinkSync("releases/missing", current);
+    }],
+    ["deployment state", ({ statePath }) => writeFileSync(statePath, "{}\n", { mode: 0o600 })],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const fixture = staticDeploymentFixture();
+      try {
+        mutate(fixture.paths);
+        const status = deploymentStaticStatusV3({ home: fixture.home, deploymentRoot: fixture.root });
+        assert.equal(status.staticIntegrityPassed, false);
+        assert.equal(fixture.executionCount(), 0);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("runtime repin qualifies the current release before switching the binding", async () => {
+  const fixture = staticDeploymentFixture();
+  try {
+    const events = [];
+    const recoveryCanonicalNode = realpathSync(process.execPath);
+    const result = await runtimeRepinV3({
+      home: fixture.home,
+      deploymentRoot: fixture.root,
+      qualificationGate: async ({ candidateNodePath, releaseRoot, environment }) => {
+        events.push({ candidateNodePath, releaseRoot, environment });
+        return true;
+      },
+    });
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0].candidateNodePath, recoveryCanonicalNode);
+    assert.equal(events[0].environment.HOME, fixture.home);
+    assert.equal(events[0].environment.OPENAI_API_KEY, undefined);
+    assert.equal(events[0].environment.ANTHROPIC_API_KEY, undefined);
+    assert.equal(result.canonicalNodePath, recoveryCanonicalNode);
+    assert.equal(inspectRuntimeBinding({ deploymentRoot: fixture.root, requireExecutable: true }).active, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("runtime repin preserves node-current on every refusal", async (t) => {
+  const cases = [
+    ["static integrity failure", async (fixture) => {
+      writeFileSync(fixture.paths.controllerPath, "tampered\n");
+      await assert.rejects(runtimeRepinV3({
+        home: fixture.home,
+        deploymentRoot: fixture.root,
+        qualificationGate: async () => true,
+      }), /deployment-pre-repin-invalid/);
+    }],
+    ["qualification failure", async (fixture) => {
+      await assert.rejects(runtimeRepinV3({
+        home: fixture.home,
+        deploymentRoot: fixture.root,
+        qualificationGate: async () => false,
+      }), /node-runtime-qualification-refused/);
+    }],
+    ["recovery mismatch", async (fixture) => {
+      const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+      state.nodeRecoveryPath = "/usr/local/opt/node/bin/node";
+      writeFileSync(fixture.paths.statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      await assert.rejects(runtimeRepinV3({
+        home: fixture.home,
+        deploymentRoot: fixture.root,
+        qualificationGate: async () => true,
+      }), /deployment-pre-repin-invalid|node-runtime-recovery-mismatch/);
+    }],
+    ["update lock held", async (fixture) => {
+      const releaseLock = acquireUpdateLock(fixture.root);
+      try {
+        await assert.rejects(runtimeRepinV3({
+          home: fixture.home,
+          deploymentRoot: fixture.root,
+          qualificationGate: async () => true,
+        }), /update-lock-active/);
+      } finally {
+        releaseLock();
+      }
+    }],
+  ];
+
+  for (const [name, refuse] of cases) {
+    await t.test(name, async () => {
+      const fixture = staticDeploymentFixture();
+      const originalTarget = readlinkSync(join(fixture.root, "node-current"));
+      try {
+        await refuse(fixture);
+        assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("runtime repin refuses to replace a healthy active binding", async () => {
+  const fixture = staticDeploymentFixture({
+    canonicalNodePath: realpathSync(process.execPath),
+    nodeVersion: process.version,
+  });
+  const originalTarget = readlinkSync(join(fixture.root, "node-current"));
+  try {
+    await assert.rejects(runtimeRepinV3({
+      home: fixture.home,
+      deploymentRoot: fixture.root,
+      qualificationGate: async () => true,
+    }), /node-runtime-still-healthy/);
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("runtime repin refuses a Node executable outside an accepted Homebrew keg", () => {
+  const fixture = staticDeploymentFixture();
+  const copiedKeg = join(dirname(fixture.root), "untrusted-keg");
+  const copiedNode = join(copiedKeg, "bin", "node");
+  const controllerUrl = new URL("../experiments/gondolin/deployment-controller.mjs", import.meta.url).href;
+  const originalTarget = readlinkSync(join(fixture.root, "node-current"));
+  try {
+    const sourceKeg = dirname(dirname(realpathSync(process.execPath)));
+    const libnodeName = readdirSync(join(sourceKeg, "lib")).find((name) => /^libnode\..+\.dylib$/.test(name));
+    assert.notEqual(libnodeName, undefined);
+    mkdirSync(join(copiedKeg, "bin"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(copiedKeg, "lib"), { recursive: true, mode: 0o700 });
+    cpSync(process.execPath, copiedNode);
+    cpSync(join(sourceKeg, "lib", libnodeName), join(copiedKeg, "lib", libnodeName));
+    chmodSync(copiedNode, 0o700);
+    const script = `
+      import { runtimeRepinV3 } from ${JSON.stringify(controllerUrl)};
+      try {
+        await runtimeRepinV3(${JSON.stringify({ home: fixture.home, deploymentRoot: fixture.root })});
+        process.stdout.write("unexpected-success");
+      } catch (error) {
+        process.stdout.write(error instanceof Error ? error.message : "unknown");
+      }
+    `;
+    const result = spawnSync(copiedNode, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+      env: { HOME: fixture.home, PATH: "/usr/bin:/bin" },
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "node-runtime-recovery-mismatch");
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("runtime repin CLI accepts no executable argument and reports only stable refusal data", () => {
+  const fixture = staticDeploymentFixture();
+  const scriptPath = fileURLToPath(new URL("../experiments/gondolin/update-local.mjs", import.meta.url));
+  const originalTarget = readlinkSync(join(fixture.root, "node-current"));
+  const environment = {
+    HOME: fixture.home,
+    PATH: "/usr/bin:/bin",
+    PI_GONDOLIN_DEPLOYMENT_ROOT: fixture.root,
+    OPENAI_API_KEY: "must-not-appear",
+  };
+  try {
+    const refusedQualification = spawnSync(process.execPath, [scriptPath, "runtime-repin"], {
+      encoding: "utf8",
+      env: environment,
+      timeout: 10_000,
+    });
+    assert.equal(refusedQualification.status, 1);
+    assert.equal(refusedQualification.stdout, "");
+    assert.equal(
+      refusedQualification.stderr,
+      "gondolin-transactional-update-refused:node-runtime-qualification-refused\n",
+    );
+    assert.doesNotMatch(refusedQualification.stderr, /must-not-appear|\/Users\//);
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
+
+    const refusedArgument = spawnSync(process.execPath, [scriptPath, "runtime-repin", process.execPath], {
+      encoding: "utf8",
+      env: environment,
+      timeout: 10_000,
+    });
+    assert.equal(refusedArgument.status, 1);
+    assert.equal(refusedArgument.stdout, "");
+    assert.equal(refusedArgument.stderr, "gondolin-transactional-update-refused:usage-invalid\n");
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
+  } finally {
+    fixture.cleanup();
+  }
+});
 
 test("les cibles update séparant Pi des catalogues et extensions sont explicites", () => {
   const selfCases = [

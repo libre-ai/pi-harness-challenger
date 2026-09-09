@@ -29,6 +29,12 @@ import {
   rollbackRelease,
   verifyCriticalManifest,
 } from "./release-manager.mjs";
+import {
+  buildRecoveryEnvironment,
+  homebrewRecoveryAnchor,
+  inspectRuntimeBinding,
+  promoteRuntimeBinding,
+} from "./runtime-binding.mjs";
 
 const DEPLOYMENT_VERSION = 3;
 const LAUNCH_AGENT_LABEL = "dev.pi-gondolin.transactional-update";
@@ -469,6 +475,7 @@ function copyRuntime(projectRoot, stagingRoot) {
   ensureOwnedDirectory(controllerRoot);
   ensureOwnedDirectory(runtimeRoot);
   cpSync(join(projectRoot, "experiments", "gondolin", "release-manager.mjs"), join(controllerRoot, "release-manager.mjs"));
+  cpSync(join(projectRoot, "experiments", "gondolin", "runtime-binding.mjs"), join(controllerRoot, "runtime-binding.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "deployment-controller.mjs"), join(controllerRoot, "deployment-controller.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "update-local.mjs"), join(controllerRoot, "update-local.mjs"));
 
@@ -489,6 +496,7 @@ function copyRuntime(projectRoot, stagingRoot) {
   const controllerFiles = [
     "controller/deployment-controller.mjs",
     "controller/release-manager.mjs",
+    "controller/runtime-binding.mjs",
     "controller/update-local.mjs",
   ];
   buildCriticalManifest(stagingRoot, controllerFiles, join(stagingRoot, "controller.sha256"));
@@ -566,15 +574,15 @@ function resolveNpmCommand() {
   return [realpathSync(process.execPath), npmPath];
 }
 
-function qualificationEnvironment(overrides = {}) {
+function qualificationEnvironment(overrides = {}, baseEnvironment = process.env) {
   return {
-    ...process.env,
+    ...baseEnvironment,
     PI_OFFLINE: "1",
     ...overrides,
   };
 }
 
-function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath }) {
+function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath, environment = process.env }) {
   if (!verifyRelease(releaseRoot)) return false;
   const metadata = readReleaseMetadata(releaseRoot);
   const paths = packagePaths(releaseRoot);
@@ -592,13 +600,16 @@ function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath })
     atomicWrite(piPath, candidatePiWrapper({ candidateRoot: releaseRoot, nodePath, launcherPath }), 0o700);
     atomicWrite(candidateLauncherPath, candidateLauncherWrapper({ piPath, nodePath, launcherPath }), 0o700);
     const runtimeRoot = join(deploymentRoot, "controller", "runtime");
-    const directRpc = run(piPath, ["--mode", "rpc"], { timeout: 10_000 });
+    const candidateEnvironment = qualificationEnvironment({}, environment);
+    const executionOptions = { cwd: qualificationRoot, env: candidateEnvironment };
+    const directRpc = run(piPath, ["--mode", "rpc"], { ...executionOptions, timeout: 10_000 });
     const forgedRpc = run(piPath, ["--mode=rpc"], {
-      env: { ...process.env, PI_GONDOLIN_RPC_ACTIVE: "1" },
+      ...executionOptions,
+      env: { ...candidateEnvironment, PI_GONDOLIN_RPC_ACTIVE: "1" },
       timeout: 10_000,
     });
-    const rpcEntry = run(nodePath, [paths.rpcEntry], { timeout: 10_000 });
-    const version = run(nodePath, [paths.cli, "--version"], { env: qualificationEnvironment(), timeout: 10_000 });
+    const rpcEntry = run(nodePath, [paths.rpcEntry], { ...executionOptions, timeout: 10_000 });
+    const version = run(nodePath, [paths.cli, "--version"], { ...executionOptions, timeout: 10_000 });
     const models = run(nodePath, [
       paths.cli,
       "--no-extensions",
@@ -608,22 +619,25 @@ function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath })
       "--no-context-files",
       "--list-models",
       "__transactional_candidate_smoke__",
-    ], { env: qualificationEnvironment(), timeout: 30_000 });
+    ], { ...executionOptions, timeout: 30_000 });
     const licenses = run(nodePath, [join(runtimeRoot, "scripts", "sandbox-license-audit.mjs")], {
-      env: qualificationEnvironment({ PI_CANDIDATE_PACKAGE_ROOT: paths.root }),
+      ...executionOptions,
+      env: qualificationEnvironment({ PI_CANDIDATE_PACKAGE_ROOT: paths.root }, environment),
       timeout: 30_000,
     });
     const e2e = run(nodePath, [join(runtimeRoot, "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
+      ...executionOptions,
       env: qualificationEnvironment({
         PI_GONDOLIN_DEPLOYMENT_ROOT: deploymentRoot,
         PI_GONDOLIN_LAUNCHER: candidateLauncherPath,
         PI_GONDOLIN_PI: piPath,
         PI_GONDOLIN_RPC_ENTRY: paths.rpcEntry,
-      }),
+      }, environment),
       timeout: 240_000,
     });
     const budgets = run(nodePath, [join(runtimeRoot, "experiments", "gondolin", "budget-test.mjs")], {
-      env: qualificationEnvironment({ PI_GONDOLIN_LAUNCHER: candidateLauncherPath }),
+      ...executionOptions,
+      env: qualificationEnvironment({ PI_GONDOLIN_LAUNCHER: candidateLauncherPath }, environment),
       timeout: 60_000,
     });
     let sandboxLicensesPassed = false;
@@ -752,23 +766,115 @@ function stateAndCurrent(paths) {
   return { state, releaseRoot, release };
 }
 
+function checkStaticIntegrity(check) {
+  try {
+    return check() === true;
+  } catch {
+    return false;
+  }
+}
+
+function runtimeConfigurationStatus(paths, state) {
+  if (state.runtimeBindingVersion === undefined) {
+    const configured = typeof state.nodePath === "string"
+      && Array.isArray(state.npmCommand)
+      && state.npmCommand[0] === state.nodePath;
+    const runtimeExecutable = checkStaticIntegrity(() => {
+      const canonicalPath = realpathSync(state.nodePath);
+      const stats = lstatSync(canonicalPath);
+      return stats.isFile() && !stats.isSymbolicLink() && isOwned(stats) && (stats.mode & 0o111) !== 0;
+    });
+    return { runtimeConfigurationMatched: configured, runtimeExecutable };
+  }
+
+  let binding;
+  const runtimeConfigurationMatched = checkStaticIntegrity(() => {
+    binding = inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: false });
+    const stableNodePath = join(paths.deploymentRoot, "node-current", "node");
+    return state.runtimeBindingVersion === 1
+      && state.nodePath === stableNodePath
+      && Array.isArray(state.npmCommand)
+      && state.npmCommand[0] === stableNodePath
+      && state.nodeRecoveryPath === homebrewRecoveryAnchor(binding.canonicalNodePath);
+  });
+  const runtimeExecutable = runtimeConfigurationMatched && checkStaticIntegrity(() => {
+    inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: true });
+    return true;
+  });
+  return { runtimeConfigurationMatched, runtimeExecutable };
+}
+
+export function deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot }) {
+  const paths = deploymentPaths(home, overrideRoot);
+  let state;
+  let releaseRoot;
+  try {
+    ({ state, releaseRoot } = stateAndCurrent(paths));
+  } catch {
+    return {
+      controllerManifestMatched: false,
+      runtimeManifestMatched: false,
+      currentReleaseMatched: false,
+      wrappersInstalled: false,
+      wrapperHashesMatched: false,
+      runtimeConfigurationMatched: false,
+      runtimeExecutable: false,
+      staticIntegrityPassed: false,
+    };
+  }
+  const controllerManifestMatched = checkStaticIntegrity(
+    () => verifyCriticalManifest(paths.deploymentRoot, join(paths.deploymentRoot, "controller.sha256")),
+  );
+  const runtimeManifestMatched = checkStaticIntegrity(
+    () => verifyCriticalManifest(paths.deploymentRoot, join(paths.deploymentRoot, "runtime.sha256")),
+  );
+  const currentReleaseMatched = checkStaticIntegrity(
+    () => verifyRelease(releaseRoot) && currentReleaseId(paths) === state.currentRelease,
+  );
+  const wrappersInstalled = checkStaticIntegrity(
+    () => symlinkResolvesTo(paths.installedPi, paths.piWrapper)
+      && symlinkResolvesTo(paths.installedLauncher, paths.launcherWrapper),
+  );
+  const wrapperHashesMatched = checkStaticIntegrity(
+    () => sha256(paths.piWrapper) === state.wrappers?.piSha256
+      && sha256(paths.launcherWrapper) === state.wrappers?.launcherSha256,
+  );
+  const runtimeStatus = runtimeConfigurationStatus(paths, state);
+  return {
+    controllerManifestMatched,
+    runtimeManifestMatched,
+    currentReleaseMatched,
+    wrappersInstalled,
+    wrapperHashesMatched,
+    ...runtimeStatus,
+    staticIntegrityPassed: controllerManifestMatched
+      && runtimeManifestMatched
+      && currentReleaseMatched
+      && wrappersInstalled
+      && wrapperHashesMatched
+      && runtimeStatus.runtimeConfigurationMatched,
+  };
+}
+
 export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
+  const staticStatus = deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot });
   const { state, releaseRoot, release } = stateAndCurrent(paths);
-  const controllerManifestMatched = verifyCriticalManifest(paths.deploymentRoot, join(paths.deploymentRoot, "controller.sha256"));
-  const runtimeManifestMatched = verifyCriticalManifest(paths.deploymentRoot, join(paths.deploymentRoot, "runtime.sha256"));
-  const currentReleaseMatched = verifyRelease(releaseRoot) && currentReleaseId(paths) === state.currentRelease;
-  const wrappersInstalled = symlinkResolvesTo(paths.installedPi, paths.piWrapper)
-    && symlinkResolvesTo(paths.installedLauncher, paths.launcherWrapper);
-  const wrapperHashesMatched = sha256(paths.piWrapper) === state.wrappers?.piSha256
-    && sha256(paths.launcherWrapper) === state.wrappers?.launcherSha256;
-  const version = run(paths.piWrapper, ["--version"], { env: qualificationEnvironment(), timeout: 10_000 });
-  const direct = run(paths.piWrapper, ["--mode", "rpc"], { timeout: 10_000 });
-  const rpcEntry = run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { timeout: 10_000 });
-  const incomplete = run(paths.launcherWrapper, [], {
-    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_GONDOLIN_"))),
-    timeout: 10_000,
-  });
+  const canExecute = staticStatus.staticIntegrityPassed && staticStatus.runtimeExecutable;
+  const refused = { status: null, stdout: "", stderr: "" };
+  const version = canExecute
+    ? run(paths.piWrapper, ["--version"], { env: qualificationEnvironment(), timeout: 10_000 })
+    : refused;
+  const direct = canExecute ? run(paths.piWrapper, ["--mode", "rpc"], { timeout: 10_000 }) : refused;
+  const rpcEntry = canExecute
+    ? run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { timeout: 10_000 })
+    : refused;
+  const incomplete = canExecute
+    ? run(paths.launcherWrapper, [], {
+        env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_GONDOLIN_"))),
+        timeout: 10_000,
+      })
+    : refused;
   let automaticUpdateInstalled = false;
   if (state.automation?.plistSha256 && existsSync(paths.launchAgentPath)) {
     try {
@@ -783,11 +889,8 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
   }
   const launchAgent = run("/bin/launchctl", ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
   const automaticUpdateLoaded = automaticUpdateInstalled && resultPassed(launchAgent);
-  const deployed = controllerManifestMatched
-    && runtimeManifestMatched
-    && currentReleaseMatched
-    && wrappersInstalled
-    && wrapperHashesMatched
+  const deployed = staticStatus.staticIntegrityPassed
+    && staticStatus.runtimeExecutable
     && resultPassed(version)
     && version.stdout.trim() === release.packageVersion
     && direct.status === 64
@@ -803,11 +906,7 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
     currentVersion: release.packageVersion,
     previousReleaseAvailable: existsSync(join(paths.deploymentRoot, "previous")),
     blockedRelease: state.blockedRelease?.releaseId ?? null,
-    controllerManifestMatched,
-    runtimeManifestMatched,
-    currentReleaseMatched,
-    wrappersInstalled,
-    wrapperHashesMatched,
+    ...staticStatus,
     directRpcRefused: direct.status === 64,
     directRpcEntryRefused: rpcEntry.status === 64,
     incompleteLauncherRefused: incomplete.status === 64,
@@ -816,6 +915,61 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
     automaticUpdateLoaded,
     sourceCheckoutRequired: false,
   };
+}
+
+function readNodeVersion(nodePath, environment) {
+  const result = run(nodePath, ["--version"], { env: environment, timeout: 10_000 });
+  const version = result.stdout.trim();
+  if (!resultPassed(result)
+    || !/^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error("node-runtime-version-invalid");
+  }
+  return version;
+}
+
+export async function runtimeRepinV3({ home, deploymentRoot: overrideRoot, qualificationGate }) {
+  if (qualificationGate !== undefined && typeof qualificationGate !== "function") {
+    throw new Error("node-runtime-qualification-gate-invalid");
+  }
+  const paths = deploymentPaths(home, overrideRoot);
+  const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  try {
+    const status = deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+    if (!status.staticIntegrityPassed) throw new Error("deployment-pre-repin-invalid");
+    if (status.runtimeExecutable) throw new Error("node-runtime-still-healthy");
+    const { state, releaseRoot } = stateAndCurrent(paths);
+    const candidateNodePath = realpathSync(process.execPath);
+    let recoveryMatches = false;
+    try {
+      recoveryMatches = homebrewRecoveryAnchor(candidateNodePath) === state.nodeRecoveryPath
+        && realpathSync(state.nodeRecoveryPath) === candidateNodePath;
+    } catch {
+      recoveryMatches = false;
+    }
+    if (!recoveryMatches) throw new Error("node-runtime-recovery-mismatch");
+    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
+    const environment = buildRecoveryEnvironment({
+      deploymentRoot: paths.deploymentRoot,
+      home,
+    });
+    const gate = qualificationGate ?? ((context) => qualifyRelease({
+      deploymentRoot: paths.deploymentRoot,
+      releaseRoot: context.releaseRoot,
+      nodePath: context.candidateNodePath,
+      launcherPath: paths.launcherPath,
+      environment: context.environment,
+    }));
+    return await promoteRuntimeBinding({
+      deploymentRoot: paths.deploymentRoot,
+      canonicalNodePath: candidateNodePath,
+      nodeVersion: readNodeVersion(candidateNodePath, environment),
+      qualifiedAt: new Date().toISOString(),
+      source: "homebrew-recovery",
+      qualificationGate: async () => gate({ candidateNodePath, releaseRoot, environment }),
+    });
+  } finally {
+    releaseLock();
+  }
 }
 
 export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }) {

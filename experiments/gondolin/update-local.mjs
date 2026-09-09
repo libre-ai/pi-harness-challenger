@@ -10,6 +10,7 @@ import {
   installV3,
   rollbackV3,
   routePiRequest,
+  runtimeRepinV3,
   updateV3,
 } from "./deployment-controller.mjs";
 
@@ -38,6 +39,15 @@ async function main() {
   }
   if (action === "rollback" && actionArgs.length === 0) {
     return rollbackV3({ home, deploymentRoot });
+  }
+  if (action === "runtime-repin" && actionArgs.length === 0) {
+    const binding = await runtimeRepinV3({ home, deploymentRoot });
+    return {
+      repaired: true,
+      bindingId: binding.bindingId,
+      nodeVersion: binding.nodeVersion,
+      qualifiedAt: binding.qualifiedAt,
+    };
   }
   if (action === "automation-enable" && actionArgs.length === 0) {
     return enableAutomaticUpdatesV3({ home, deploymentRoot });
