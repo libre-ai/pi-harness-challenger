@@ -29,10 +29,12 @@ import {
   buildCriticalManifest,
   classifyUpdateRequest,
   compareVersions,
+  listReleaseManifestFiles,
   parseLatestRelease,
   promoteCandidate,
   releaseIdFor,
   rollbackRelease,
+  verifyCompleteReleaseManifest,
   verifyCriticalManifest,
 } from "./release-manager.mjs";
 import {
@@ -372,6 +374,21 @@ function guardCandidateRpcEntry(candidateRoot) {
   return { originalPath, guardedSha256: sha256(paths.rpcEntry), originalSha256: sha256(originalPath) };
 }
 
+function removeNpmBinDirectories(current) {
+  for (const entry of readdirSync(current, { withFileTypes: true })) {
+    const path = join(current, entry.name);
+    const stats = lstatSync(path);
+    if (entry.name === ".bin") {
+      if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
+        throw new Error("candidate-bin-directory-unsafe");
+      }
+      rmSync(path, { recursive: true });
+      continue;
+    }
+    if (stats.isDirectory() && !stats.isSymbolicLink()) removeNpmBinDirectories(path);
+  }
+}
+
 function writeReleaseMetadata(candidateRoot, release, source, rpcEntry) {
   const metadata = {
     version: 1,
@@ -382,16 +399,11 @@ function writeReleaseMetadata(candidateRoot, release, source, rpcEntry) {
     rpcEntry,
   };
   writeOwnedJson(join(candidateRoot, "release.json"), metadata);
-  const criticalPaths = [
-    "release.json",
-    "rpc-entry.original.js",
-    join(PACKAGE_RELATIVE_PATH, "package.json"),
-    join(PACKAGE_RELATIVE_PATH, "dist", "cli.js"),
-    join(PACKAGE_RELATIVE_PATH, "dist", "rpc-entry.js"),
-    join(PACKAGE_RELATIVE_PATH, "npm-shrinkwrap.json"),
-  ].map((path) => path.split(sep).join("/"));
-  if (existsSync(join(candidateRoot, "package-lock.json"))) criticalPaths.push("package-lock.json");
-  buildCriticalManifest(candidateRoot, criticalPaths, join(candidateRoot, "critical.sha256"));
+  removeNpmBinDirectories(candidateRoot);
+  const manifestPath = join(candidateRoot, "critical.sha256");
+  const manifestFiles = listReleaseManifestFiles(candidateRoot)
+    .filter((path) => path !== "critical.sha256");
+  buildCriticalManifest(candidateRoot, manifestFiles, manifestPath);
   return metadata;
 }
 
@@ -403,7 +415,7 @@ function readReleaseMetadata(releaseRoot) {
 }
 
 function verifyRelease(releaseRoot) {
-  return verifyCriticalManifest(releaseRoot, join(releaseRoot, "critical.sha256"));
+  return verifyCompleteReleaseManifest(releaseRoot, join(releaseRoot, "critical.sha256"));
 }
 
 function currentReleaseRoot(deploymentRoot) {
@@ -488,6 +500,11 @@ RELEASE="$ROOT/$TARGET"
 [ -d "$RELEASE" ] && [ ! -L "$RELEASE" ] || refuse
 (
   cd "$RELEASE"
+  [ -f critical.sha256 ] && [ ! -L critical.sha256 ]
+  [ -z "$(/usr/bin/find . ! -type d ! -type f -print -quit)" ]
+  EXPECTED=$(/usr/bin/wc -l < critical.sha256 | /usr/bin/tr -d ' ')
+  ACTUAL=$(/usr/bin/find . -type f ! -path './critical.sha256' -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  [ "$ACTUAL" = "$EXPECTED" ]
   /usr/bin/shasum -a 256 -c critical.sha256 >/dev/null 2>&1
 ) || refuse
 REAL_PI="$RELEASE/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
@@ -544,6 +561,11 @@ case "$TARGET" in *..*|*\\\\*|*"\n"*) refuse ;; esac
 RELEASE="$ROOT/$TARGET"
 (
   cd "$RELEASE"
+  [ -f critical.sha256 ] && [ ! -L critical.sha256 ]
+  [ -z "$(/usr/bin/find . ! -type d ! -type f -print -quit)" ]
+  EXPECTED=$(/usr/bin/wc -l < critical.sha256 | /usr/bin/tr -d ' ')
+  ACTUAL=$(/usr/bin/find . -type f ! -path './critical.sha256' -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  [ "$ACTUAL" = "$EXPECTED" ]
   /usr/bin/shasum -a 256 -c critical.sha256 >/dev/null 2>&1
 ) || refuse
 unset PI_GONDOLIN_RPC_ACTIVE

@@ -31,6 +31,7 @@
     "test:release-transaction:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/release-transaction.mjs --test-coverage-lines=90 --test-coverage-branches=70 --test-coverage-functions=100 test/release-transaction.test.mjs",
     "test:operation-audit:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/operation-audit.mjs --test-coverage-lines=90 --test-coverage-branches=70 --test-coverage-functions=100 test/operation-audit.test.mjs",
     "test:bounded-json:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/bounded-json.mjs --test-coverage-lines=90 --test-coverage-branches=80 --test-coverage-functions=100 test/bounded-json.test.mjs",
+    "benchmark:release-integrity": "node experiments/gondolin/release-integrity-benchmark.mjs",
     "smoke": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./extensions/policy-gate/index.mjs -e ./extensions/handoff/index.mjs --list-models __challenger_smoke__",
     "smoke:skills": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --skill ./skills --list-models __challenger_skills_smoke__",
     "smoke:rpc": "node experiments/gondolin/deployed-rpc-e2e.mjs",

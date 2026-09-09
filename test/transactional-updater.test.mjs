@@ -47,11 +47,14 @@ import {
   classifyUpdateRequest,
   compareVersions,
   lockOwnerAlive,
+  listReleaseManifestFiles,
   parseLatestRelease,
   promoteCandidate,
   releaseIdFor,
   rollbackRelease,
+  upgradeReleaseManifest,
   verifyCriticalManifest,
+  verifyCompleteReleaseManifest,
 } from "../experiments/gondolin/release-manager.mjs";
 import {
   beginAuditOperation,
@@ -63,6 +66,7 @@ import {
   completeReleaseTransaction,
   recoverReleaseTransaction,
 } from "../experiments/gondolin/release-transaction.mjs";
+import { benchmarkReleaseIntegrity } from "../experiments/gondolin/release-integrity-benchmark.mjs";
 
 function temporaryRoot(prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -1041,6 +1045,8 @@ test("les wrappers stables réparent seulement un binding Node cassé", () => {
     assert.match(wrapper, /runtime-repin/);
     assert.doesNotMatch(wrapper, /Cellar\/node/);
     assert.doesNotMatch(wrapper, /OPENAI_API_KEY|ANTHROPIC_API_KEY/);
+    assert.match(wrapper, /find \. ! -type d ! -type f/);
+    assert.match(wrapper, /ACTUAL=.*find \. -type f/);
   }
   assert.equal((piWrapper.match(/controller\.sha256/g) ?? []).length, 1);
   assert.equal((launcherWrapper.match(/controller\.sha256/g) ?? []).length, 1);
@@ -1240,6 +1246,119 @@ test("le manifeste critique refuse les chemins hors release, les symlinks et la 
     writeFileSync(join(root, "real"), "value\n");
     symlinkSync(join(root, "real"), join(root, "linked"));
     assert.throws(() => buildCriticalManifest(root, ["linked"], manifestPath), /manifest-file-unsafe/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("le manifeste de release couvre tout le graphe de fichiers et refuse les entrées ambiguës", async (t) => {
+  await t.test("transitive module drift", () => {
+    const { root, cleanup } = temporaryRoot("pi-release-complete-manifest-");
+    try {
+      mkdirSync(join(root, "dist"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, "dist", "cli.js"), 'import "./internal.js";\n', { mode: 0o600 });
+      writeFileSync(join(root, "dist", "internal.js"), "export const value = 1;\n", { mode: 0o600 });
+      writeFileSync(join(root, "package.json"), "{}\n", { mode: 0o600 });
+      const manifestPath = join(root, "critical.sha256");
+      buildCriticalManifest(
+        root,
+        listReleaseManifestFiles(root).filter((path) => path !== "critical.sha256"),
+        manifestPath,
+      );
+      assert.equal(verifyCompleteReleaseManifest(root, manifestPath), true);
+      assert.match(readFileSync(manifestPath, "utf8"), /dist\/internal\.js/);
+      writeFileSync(join(root, "dist", "internal.js"), "export const value = 2;\n", { mode: 0o600 });
+      assert.equal(verifyCompleteReleaseManifest(root, manifestPath), false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  for (const [name, create, expected] of [
+    ["symlink", (root) => {
+      writeFileSync(join(root, "target"), "value\n", { mode: 0o600 });
+      symlinkSync("target", join(root, "linked"));
+    }, /release-tree-entry-unsafe/],
+    ["carriage return", (root) => {
+      writeFileSync(join(root, "bad\rname"), "value\n", { mode: 0o600 });
+    }, /release-tree-path-unsafe/],
+    ["special file", (root) => {
+      const result = spawnSync("mkfifo", [join(root, "pipe")], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+    }, /release-tree-entry-unsafe/],
+  ]) {
+    await t.test(name, () => {
+      const { root, cleanup } = temporaryRoot("pi-release-unsafe-entry-");
+      try {
+        create(root);
+        assert.throws(() => listReleaseManifestFiles(root), expected);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+
+  await t.test("duplicate path", () => {
+    const { root, cleanup } = temporaryRoot("pi-release-duplicate-path-");
+    try {
+      writeFileSync(join(root, "file"), "value\n", { mode: 0o600 });
+      assert.throws(
+        () => buildCriticalManifest(root, ["file", "file"], join(root, "critical.sha256")),
+        /manifest-path-duplicate/,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test("le benchmark de release rapporte 20 vérifications sans chemin local", () => {
+  const { root, cleanup } = temporaryRoot("pi-release-benchmark-");
+  try {
+    writeFileSync(join(root, "release.json"), "{}\n", { mode: 0o600 });
+    buildCriticalManifest(root, ["release.json"], join(root, "critical.sha256"));
+    let tick = 0;
+    const result = benchmarkReleaseIntegrity({
+      releaseRoot: root,
+      runs: 20,
+      now: () => tick++,
+    });
+    assert.deepEqual(result, {
+      fileCount: 1,
+      runs: 20,
+      medianMs: 1,
+      p95Ms: 1,
+      maxMs: 1,
+    });
+    assert.doesNotMatch(JSON.stringify(result), /Users|private|release-benchmark/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("un manifeste partiel n’est renforcé qu’après vérification et qualification", async () => {
+  const { root, cleanup } = temporaryRoot("pi-release-manifest-upgrade-");
+  try {
+    mkdirSync(join(root, "dist"), { mode: 0o700 });
+    writeFileSync(join(root, "dist", "cli.js"), 'import "./internal.js";\n', { mode: 0o600 });
+    writeFileSync(join(root, "dist", "internal.js"), "export const value = 1;\n", { mode: 0o600 });
+    const manifestPath = join(root, "critical.sha256");
+    buildCriticalManifest(root, ["dist/cli.js"], manifestPath);
+    const originalManifest = readFileSync(manifestPath, "utf8");
+    assert.equal(verifyCriticalManifest(root, manifestPath), true);
+    assert.equal(verifyCompleteReleaseManifest(root, manifestPath), false);
+    await assert.rejects(
+      upgradeReleaseManifest({ releaseRoot: root, qualificationGate: async () => false }),
+      /release-manifest-upgrade-qualification-refused/,
+    );
+    assert.equal(readFileSync(manifestPath, "utf8"), originalManifest);
+    assert.equal(await upgradeReleaseManifest({
+      releaseRoot: root,
+      qualificationGate: async () => verifyCriticalManifest(root, manifestPath),
+    }), true);
+    assert.equal(verifyCompleteReleaseManifest(root, manifestPath), true);
+    assert.match(readFileSync(manifestPath, "utf8"), /dist\/internal\.js/);
+    assert.equal(await upgradeReleaseManifest({ releaseRoot: root, qualificationGate: async () => false }), false);
   } finally {
     cleanup();
   }

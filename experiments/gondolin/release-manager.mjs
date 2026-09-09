@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   renameSync,
@@ -39,9 +43,26 @@ function ensureOwnedDirectory(path, mode = 0o700) {
 
 function atomicWrite(path, content, mode = 0o600) {
   const temporaryPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temporaryPath, content, { flag: "wx", mode });
-  renameSync(temporaryPath, path);
-  chmodSync(path, mode);
+  try {
+    writeFileSync(temporaryPath, content, { flag: "wx", mode });
+    const fileDescriptor = openSync(temporaryPath, "r");
+    try {
+      fsyncSync(fileDescriptor);
+    } finally {
+      closeSync(fileDescriptor);
+    }
+    renameSync(temporaryPath, path);
+    chmodSync(path, mode);
+    const directoryDescriptor = openSync(dirname(path), "r");
+    try {
+      fsyncSync(directoryDescriptor);
+    } finally {
+      closeSync(directoryDescriptor);
+    }
+  } catch (error) {
+    if (lstatExists(temporaryPath)) rmSync(temporaryPath);
+    throw error;
+  }
 }
 
 function atomicSymlink(target, path) {
@@ -90,6 +111,7 @@ function validateManifestPath(releaseRoot, relativePath) {
     || isAbsolute(relativePath)
     || relativePath.includes("\0")
     || relativePath.includes("\n")
+    || relativePath.includes("\r")
     || relativePath.split(/[\\/]/).some((part) => part === ".." || part === "")) {
     throw new Error("manifest-path-invalid");
   }
@@ -351,6 +373,37 @@ export function buildCriticalManifest(releaseRoot, relativePaths, manifestPath) 
   return entries.length;
 }
 
+export function listReleaseManifestFiles(releaseRoot) {
+  const rootStats = lstatSync(releaseRoot);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !isOwned(rootStats)) {
+    throw new Error("release-tree-root-unsafe");
+  }
+  const root = realpathSync(releaseRoot);
+  const files = [];
+
+  function visit(directory) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = relative(root, path).split(sep).join("/");
+      if (!relativePath
+        || relativePath.includes("\0")
+        || relativePath.includes("\n")
+        || relativePath.includes("\r")
+        || relativePath.includes("\\")) {
+        throw new Error("release-tree-path-unsafe");
+      }
+      const stats = lstatSync(path);
+      if (stats.isSymbolicLink() || !isOwned(stats)) throw new Error("release-tree-entry-unsafe");
+      if (stats.isDirectory()) visit(path);
+      else if (stats.isFile()) files.push(relativePath);
+      else throw new Error("release-tree-entry-unsafe");
+    }
+  }
+
+  visit(root);
+  return files.sort((left, right) => left.localeCompare(right));
+}
+
 export function verifyCriticalManifest(releaseRoot, manifestPath) {
   try {
     const manifestStats = lstatSync(manifestPath);
@@ -370,6 +423,69 @@ export function verifyCriticalManifest(releaseRoot, manifestPath) {
   } catch {
     return false;
   }
+}
+
+export function verifyCompleteReleaseManifest(releaseRoot, manifestPath) {
+  if (!verifyCriticalManifest(releaseRoot, manifestPath)) return false;
+  try {
+    const manifested = readFileSync(manifestPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => MANIFEST_LINE_PATTERN.exec(line)?.[2]);
+    if (manifested.some((path) => path === undefined)) return false;
+    const expected = listReleaseManifestFiles(releaseRoot)
+      .filter((path) => path !== relative(realpathSync(releaseRoot), realpathSync(manifestPath)).split(sep).join("/"));
+    return manifested.length === expected.length
+      && manifested.every((path, index) => path === expected[index]);
+  } catch {
+    return false;
+  }
+}
+
+export async function upgradeReleaseManifest({
+  releaseRoot,
+  qualificationGate,
+  manifestPath = join(releaseRoot, "critical.sha256"),
+}) {
+  if (verifyCompleteReleaseManifest(releaseRoot, manifestPath)) return false;
+  if (!verifyCriticalManifest(releaseRoot, manifestPath)) {
+    throw new Error("release-manifest-upgrade-current-invalid");
+  }
+  if (typeof qualificationGate !== "function") {
+    throw new Error("release-manifest-upgrade-gate-invalid");
+  }
+  if (await qualificationGate(releaseRoot) !== true) {
+    throw new Error("release-manifest-upgrade-qualification-refused");
+  }
+
+  const root = realpathSync(releaseRoot);
+  const relativeManifestPath = relative(root, realpathSync(manifestPath)).split(sep).join("/");
+  const manifestFiles = listReleaseManifestFiles(root)
+    .filter((path) => path !== relativeManifestPath);
+  if (manifestFiles.length === 0) throw new Error("release-manifest-upgrade-candidate-invalid");
+
+  const candidateManifestPath = `${manifestPath}.upgrade-${process.pid}-${randomUUID()}`;
+  try {
+    buildCriticalManifest(root, manifestFiles, candidateManifestPath);
+    if (!verifyCriticalManifest(root, candidateManifestPath)) {
+      throw new Error("release-manifest-upgrade-candidate-invalid");
+    }
+    renameSync(candidateManifestPath, manifestPath);
+    chmodSync(manifestPath, 0o600);
+    const directoryDescriptor = openSync(dirname(manifestPath), "r");
+    try {
+      fsyncSync(directoryDescriptor);
+    } finally {
+      closeSync(directoryDescriptor);
+    }
+  } catch (error) {
+    if (lstatExists(candidateManifestPath)) rmSync(candidateManifestPath);
+    throw error;
+  }
+  if (!verifyCompleteReleaseManifest(root, manifestPath)) {
+    throw new Error("release-manifest-upgrade-candidate-invalid");
+  }
+  return true;
 }
 
 export async function promoteCandidate({
