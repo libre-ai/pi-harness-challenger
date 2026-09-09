@@ -261,10 +261,15 @@ function symlinkResolvesTo(path, expected) {
 }
 
 function run(command, args, options = {}) {
+  if (options.env !== undefined && options.interactive === true) {
+    throw new Error("child-environment-conflict");
+  }
+  const environment = options.interactive === true ? process.env : options.env;
+  if (environment === undefined) throw new Error("child-environment-missing");
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     encoding: "utf8",
-    env: options.env ?? process.env,
+    env: environment,
     maxBuffer: 8 * 1024 * 1024,
     stdio: options.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
     timeout: options.timeout ?? 30_000,
@@ -598,6 +603,14 @@ function deploymentPaths(home, overrideRoot) {
   };
 }
 
+function recoveryEnvironment(paths) {
+  return buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home: paths.home });
+}
+
+function runLaunchctl(paths, args) {
+  return run("/bin/launchctl", args, { env: recoveryEnvironment(paths), timeout: 10_000 });
+}
+
 function copyRuntime(projectRoot, stagingRoot) {
   const controllerRoot = join(stagingRoot, "controller");
   const runtimeRoot = join(controllerRoot, "runtime");
@@ -698,19 +711,36 @@ function prepareMigratedRelease(paths, stagingRoot, legacyState) {
 }
 
 function resolveExecutable(name) {
-  const result = run("/bin/sh", ["-lc", `command -v ${name}`], { timeout: 10_000 });
-  if (!resultPassed(result)) throw new Error("required-executable-missing");
-  const path = result.stdout.trim();
-  if (!path.startsWith("/") || path.includes("\0") || path.includes("\n")) throw new Error("required-executable-unsafe");
-  const canonicalPath = realpathSync(path);
-  const stats = lstatSync(canonicalPath);
-  if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("required-executable-unsafe");
-  return canonicalPath;
+  for (const directory of ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]) {
+    const path = join(directory, name);
+    try {
+      const canonicalPath = realpathSync(path);
+      const stats = lstatSync(canonicalPath);
+      if (stats.isFile() && !stats.isSymbolicLink() && (stats.mode & 0o111) !== 0) return canonicalPath;
+    } catch {
+      // A missing fixed candidate is expected; arbitrary PATH entries are not consulted.
+    }
+  }
+  throw new Error("required-executable-missing");
 }
 
 function resolveNpmCommand() {
-  const npmPath = process.env.npm_execpath ? realpathSync(process.env.npm_execpath) : resolveExecutable("npm");
-  return [realpathSync(process.execPath), npmPath];
+  const nodePath = realpathSync(process.execPath);
+  const candidates = [
+    "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js",
+    "/usr/local/lib/node_modules/npm/bin/npm-cli.js",
+    resolve(dirname(nodePath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const npmPath of candidates) {
+    try {
+      const canonicalPath = realpathSync(npmPath);
+      const stats = lstatSync(canonicalPath);
+      if (stats.isFile() && !stats.isSymbolicLink() && isOwned(stats)) return [nodePath, canonicalPath];
+    } catch {
+      // Only fixed installation layouts are eligible for the administrative npm command.
+    }
+  }
+  throw new Error("package-command-missing");
 }
 
 export function buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath, npmPath }) {
@@ -724,7 +754,17 @@ export function buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath,
   };
 }
 
-function qualificationEnvironment(overrides = {}, baseEnvironment = process.env) {
+export function qualificationEnvironment(overrides = {}, baseEnvironment) {
+  if (!baseEnvironment || typeof baseEnvironment !== "object" || Array.isArray(baseEnvironment)) {
+    throw new Error("child-environment-missing");
+  }
+  const allowedBase = new Set(["HOME", "PATH", "PI_GONDOLIN_DEPLOYMENT_ROOT", "TMPDIR"]);
+  if (Object.keys(baseEnvironment).some((key) => !allowedBase.has(key))) {
+    throw new Error("child-environment-base-invalid");
+  }
+  if (Object.keys(overrides).some((key) => key !== "PI_CANDIDATE_PACKAGE_ROOT" && !key.startsWith("PI_GONDOLIN_"))) {
+    throw new Error("child-environment-override-invalid");
+  }
   return {
     ...baseEnvironment,
     PI_OFFLINE: "1",
@@ -732,7 +772,7 @@ function qualificationEnvironment(overrides = {}, baseEnvironment = process.env)
   };
 }
 
-function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath, environment = process.env }) {
+function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath, environment }) {
   if (!verifyRelease(releaseRoot)) return false;
   const metadata = readReleaseMetadata(releaseRoot);
   const paths = packagePaths(releaseRoot);
@@ -832,7 +872,7 @@ function writeDeploymentWrappers(stagingRoot, finalRoot, nodePath, nodeRecoveryP
   );
 }
 
-function postActivationSmoke(paths, expectedVersion, environment = process.env) {
+function postActivationSmoke(paths, expectedVersion, environment) {
   const smokeEnvironment = qualificationEnvironment({}, environment);
   const version = run(paths.piWrapper, ["--version"], { env: smokeEnvironment, timeout: 10_000 });
   const direct = run(paths.piWrapper, ["--mode", "rpc"], { env: smokeEnvironment, timeout: 10_000 });
@@ -999,10 +1039,10 @@ function restoreAdoptionBackups(paths, journal) {
   }
   const launchdBackup = join(backupRoot, "launchd");
   if (existsSync(launchdBackup)) {
-    run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     if (existsSync(paths.launchAgentPath)) rmSync(paths.launchAgentPath);
     renameSync(launchdBackup, paths.launchAgentPath);
-    const loaded = run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath], { timeout: 10_000 });
+    const loaded = runLaunchctl(paths, ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath]);
     if (!resultPassed(loaded)) throw new Error("adoption-launch-agent-restore-refused");
   } else if (journal.artifacts.launchd.oldSha256 === ""
     && existsSync(paths.launchAgentPath)
@@ -1019,7 +1059,7 @@ function verifyAdoptionArtifacts(paths, journal) {
       : Object.keys(journal.artifacts).filter((key) => key !== "launchd");
     if (!installedKeys.every((key) => actual[key] === journal.artifacts[key].newSha256)) return false;
     if (journal.phase !== "launchd-loaded" || journal.artifacts.launchd.newSha256 === "") return true;
-    const loaded = run("/bin/launchctl", ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    const loaded = runLaunchctl(paths, ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     return resultPassed(loaded);
   } catch {
     return false;
@@ -1082,8 +1122,8 @@ async function finishAdoptionActivation(paths, journal, postActivationGate, runt
         || sha256(paths.launchAgentPath) !== state.automation.plistSha256) {
         throw new Error("adoption-launch-agent-integrity-refused");
       }
-      run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
-      const loaded = run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath], { timeout: 10_000 });
+      runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
+      const loaded = runLaunchctl(paths, ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath]);
       if (!resultPassed(loaded)) throw new Error("adoption-launch-agent-load-refused");
     }
     advanceRuntimeAdoption({
@@ -1489,20 +1529,27 @@ export function deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot })
 
 export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
+  const environment = recoveryEnvironment(paths);
   const staticStatus = deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot });
   const { state, releaseRoot, release } = stateAndCurrent(paths);
   const canExecute = staticStatus.staticIntegrityPassed && staticStatus.runtimeExecutable;
   const refused = { status: null, stdout: "", stderr: "" };
   const version = canExecute
-    ? run(paths.piWrapper, ["--version"], { env: qualificationEnvironment(), timeout: 10_000 })
+    ? run(paths.piWrapper, ["--version"], { env: qualificationEnvironment({}, environment), timeout: 10_000 })
     : refused;
-  const direct = canExecute ? run(paths.piWrapper, ["--mode", "rpc"], { timeout: 10_000 }) : refused;
+  const direct = canExecute
+    ? run(paths.piWrapper, ["--mode", "rpc"], { env: environment, timeout: 10_000 })
+    : refused;
   const rpcEntry = canExecute
-    ? run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { timeout: 10_000 })
+    ? run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { env: environment, timeout: 10_000 })
     : refused;
   const incomplete = canExecute
     ? run(paths.launcherWrapper, [], {
-        env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_GONDOLIN_"))),
+        env: {
+          HOME: environment.HOME,
+          PATH: environment.PATH,
+          TMPDIR: environment.TMPDIR,
+        },
         timeout: 10_000,
       })
     : refused;
@@ -1518,7 +1565,11 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
       automaticUpdateInstalled = false;
     }
   }
-  const launchAgent = run("/bin/launchctl", ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+  const launchAgent = run(
+    "/bin/launchctl",
+    ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`],
+    { env: environment, timeout: 10_000 },
+  );
   const automaticUpdateLoaded = automaticUpdateInstalled && resultPassed(launchAgent);
   const deployed = staticStatus.staticIntegrityPassed
     && staticStatus.runtimeExecutable
@@ -1622,19 +1673,19 @@ export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot })
       qemuPath: state.qemuPath,
     });
     atomicWrite(paths.launchAgentPath, plist);
-    run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     state.automation = { label: LAUNCH_AGENT_LABEL, plistSha256: sha256(paths.launchAgentPath), intervalSeconds: 3600 };
     writeOwnedJson(paths.statePath, state);
-    const bootstrap = run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath], { timeout: 10_000 });
+    const bootstrap = runLaunchctl(paths, ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath]);
     if (!resultPassed(bootstrap)) {
       delete state.automation;
       writeOwnedJson(paths.statePath, state);
       rmSync(paths.launchAgentPath);
       throw new Error("launch-agent-bootstrap-refused");
     }
-    const loaded = run("/bin/launchctl", ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    const loaded = runLaunchctl(paths, ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     if (!resultPassed(loaded)) {
-      run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+      runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
       delete state.automation;
       writeOwnedJson(paths.statePath, state);
       rmSync(paths.launchAgentPath);
@@ -1651,7 +1702,7 @@ export function disableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
   try {
     const { state } = stateAndCurrent(paths);
-    run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     if (existsSync(paths.launchAgentPath)) {
       const stats = lstatSync(paths.launchAgentPath);
       if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("launch-agent-path-unsafe");
@@ -1679,11 +1730,11 @@ async function fetchLatestRelease(policy) {
   return readBoundedJsonResponse(response, { maxBytes: 128 * 1024 });
 }
 
-function resolveRegistryIntegrity(state, policy, packageName, version) {
+function resolveRegistryIntegrity(state, policy, packageName, version, environment) {
   const result = runCommand(
     state.npmCommand,
     registryViewArguments(policy, packageName, version),
-    { timeout: 30_000 },
+    { env: environment, timeout: 30_000 },
   );
   if (!resultPassed(result)) throw new Error("registry-integrity-request-refused");
   let integrity;
@@ -1696,7 +1747,7 @@ function resolveRegistryIntegrity(state, policy, packageName, version) {
   return integrity;
 }
 
-function installCandidatePackage(state, policy, candidateRoot, release) {
+function installCandidatePackage(state, policy, candidateRoot, release, environment) {
   ensureOwnedDirectory(candidateRoot);
   writeFileSync(join(candidateRoot, "package.json"), `${JSON.stringify({
     private: true,
@@ -1705,7 +1756,7 @@ function installCandidatePackage(state, policy, candidateRoot, release) {
   const result = runCommand(
     state.npmCommand,
     candidateInstallArguments(policy, candidateRoot, release),
-    { timeout: 180_000 },
+    { env: environment, timeout: 180_000 },
   );
   if (!resultPassed(result)) throw new Error("candidate-package-install-refused");
   verifyCandidatePackage(candidateRoot, release);
@@ -1722,7 +1773,11 @@ function currentReleaseId(paths) {
 
 function updateExtensionsIfRequested(paths, requested) {
   if (!requested) return;
-  const extensionUpdate = run(paths.piWrapper, ["update", "--extensions"], { inherit: true, timeout: 180_000 });
+  const extensionUpdate = run(paths.piWrapper, ["update", "--extensions"], {
+    inherit: true,
+    interactive: true,
+    timeout: 180_000,
+  });
   if (!resultPassed(extensionUpdate)) throw new Error("extension-update-refused");
 }
 
@@ -1848,6 +1903,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
       supplyChainPolicy,
       validatedTarget.packageName,
       validatedTarget.version,
+      environment,
     );
     release = parseLatestRelease(latestPayload, integrity);
     const releaseId = releaseIdFor(release);
@@ -1885,7 +1941,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
     const candidateRoot = join(candidatesRoot, releaseId);
     ensureOwnedDirectory(candidatesRoot);
     removeOwnedCandidate(candidateRoot, candidatesRoot);
-    installCandidatePackage(state, supplyChainPolicy, candidateRoot, release);
+    installCandidatePackage(state, supplyChainPolicy, candidateRoot, release, environment);
     const before = releaseTransactionSnapshot(paths, state);
     const nextState = copyDeploymentState(state);
     nextState.currentRelease = releaseId;
@@ -2107,6 +2163,7 @@ function delegateToCurrentPi(paths, args) {
   const { state } = stateAndCurrent(paths);
   const result = run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "cli.js"), ...args], {
     inherit: true,
+    interactive: true,
     timeout: 180_000,
   });
   return commandStatus(result);

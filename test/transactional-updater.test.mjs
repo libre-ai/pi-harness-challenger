@@ -28,6 +28,7 @@ import {
   buildDeploymentRuntimeState,
   deploymentStaticStatusV3,
   installV3,
+  qualificationEnvironment,
   renderLaunchAgentPlist,
   renderStableLauncherWrapper,
   renderStablePiWrapper,
@@ -376,6 +377,33 @@ test("static deployment validation accepts a missing qualified runtime without e
     assert.equal(fixture.executionCount(), 0);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("administrative child environments require an explicit secret-free base", () => {
+  assert.throws(() => qualificationEnvironment(), /child-environment-missing/);
+  const base = {
+    HOME: "/Users/test",
+    PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    PI_GONDOLIN_DEPLOYMENT_ROOT: "/Users/test/deployment",
+    TMPDIR: "/Users/test/deployment/tmp",
+  };
+  const environment = qualificationEnvironment({ PI_GONDOLIN_LAUNCHER: "/safe/launcher" }, base);
+  assert.deepEqual(environment, {
+    ...base,
+    PI_OFFLINE: "1",
+    PI_GONDOLIN_LAUNCHER: "/safe/launcher",
+  });
+  for (const key of [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "HTTPS_PROXY",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NPM_CONFIG_REGISTRY",
+    "PWD",
+  ]) {
+    assert.equal(environment[key], undefined, key);
   }
 });
 

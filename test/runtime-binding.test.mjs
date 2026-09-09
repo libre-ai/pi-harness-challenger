@@ -104,9 +104,18 @@ test("the recovery environment excludes caller secrets and project state", () =>
     PI_GONDOLIN_DEPLOYMENT_ROOT: "/Users/test/.local/share/pi-harness-challenger/gondolin-rpc/v3",
     TMPDIR: "/Users/test/.local/share/pi-harness-challenger/gondolin-rpc/v3/tmp",
   });
-  assert.equal(environment.ANTHROPIC_API_KEY, undefined);
-  assert.equal(environment.OPENAI_API_KEY, undefined);
-  assert.equal(environment.PWD, undefined);
+  for (const key of [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "HTTPS_PROXY",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NPM_CONFIG_REGISTRY",
+    "PI_PROJECT_ROOT",
+    "PWD",
+  ]) {
+    assert.equal(environment[key], undefined, key);
+  }
 });
 
 test("a qualified runtime binding is immutable and activated atomically", async () => {
