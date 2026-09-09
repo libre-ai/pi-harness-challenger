@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed for implementation on `fix/node-runtime-repin`.
+Revised after adversarial review. The automatic hardened-recovery direction is
+accepted; this revision is pending final approval before implementation planning.
 
 ## Context
 
@@ -35,32 +36,56 @@ In priority order:
 
 ## Decision
 
-### Stable deployment-owned binding
+### Immutable deployment-owned bindings
 
-The deployment will own a `node-current` symlink. Its target is the canonical,
-versioned Node executable that passed qualification. `deployment.json.nodePath`
-and the Node prefix of `npmCommand` will reference this deployment-owned symlink
-rather than the Homebrew keg directly.
+The deployment will keep immutable binding generations under
+`node-bindings/<binding-id>/`. Each generation contains:
 
-The binding remains exact: the symlink target is a canonical keg path, not the
-mutable Homebrew `opt` link. Switching interpreters consists of one atomic
-symlink rename, so wrappers, state, and `launchd` configuration do not need to be
-rewritten after each Homebrew upgrade.
+- an owned `node` symlink to the canonical, versioned Node executable;
+- private metadata with `runtimeBindingVersion: 1`, the canonical path, the Node
+  version, an ISO 8601 qualification timestamp, and the recovery source;
+- a manifest covering the metadata and the symlink target text.
 
-### Runtime dispatcher
+The metadata is an audit record, not a claim that hashing the small Node launcher
+proves the integrity of its complete dynamic runtime. It contains no username,
+command, project path, prompt, secret, or other personal data.
 
-The controller will render a deployment-owned `node-dispatch` POSIX shell
-entry point. Stable Pi wrappers and the `launchd` job will invoke this dispatcher
-instead of embedding an exact keg path.
+The deployment's `node-current` symlink selects one immutable binding generation.
+Previous binding generations are retained as non-sensitive qualification evidence.
+`deployment.json.nodePath` and the Node prefix of `npmCommand` reference
+`node-current/node` rather than the Homebrew keg directly. An explicit
+`runtimeBindingVersion: 1` state marker prevents old and new `nodePath` semantics
+from being inferred from path shape.
 
-On the healthy path the dispatcher will:
+The active binding remains exact: its inner symlink target is a canonical keg
+path, not the mutable Homebrew `opt` link. Switching interpreters consists of one
+atomic replacement of `node-current`, so wrappers, state, and `launchd`
+configuration do not need to be rewritten after each Homebrew upgrade.
 
-1. verify the deployed controller manifest;
-2. require `node-current` to be an owned symlink resolving to an executable;
+### Recovery integrated into stable wrappers
+
+The two stable POSIX shell wrappers will contain the same short runtime-binding
+check. This deliberate duplication follows the rule of three and avoids a second
+shell `exec` on every Pi launch. Candidate wrappers continue to receive the exact
+candidate Node path during qualification and do not contain recovery behavior.
+
+On the healthy path each stable wrapper will:
+
+1. perform its existing controller, runtime, and release manifest checks exactly
+   once;
+2. require `node-current` to select a binding whose `node` entry is a symlink
+   resolving to an executable;
 3. `exec` the pinned interpreter with the original arguments.
 
-No network request, version probe, hash of the Node binary, or extra Node process
-is added to the healthy path.
+No network request, new manifest hash, version probe, Node binary hash, extra
+shell, or extra Node process is added to the healthy path.
+
+The deployment root is already private. Full ownership, mode, target-shape, and
+binding-manifest validation remains in controller status, update, and recovery
+paths rather than adding a `stat` subprocess to every healthy launch.
+
+The `launchd` job invokes the stable Pi wrapper with `update`, reusing the same
+integrity and recovery path instead of embedding a Node executable.
 
 ### Restricted recovery path
 
@@ -73,27 +98,41 @@ anchor from the active Homebrew Node layout:
   `/usr/local/opt/node/bin/node`.
 
 Unsupported layouts fail closed instead of falling back to `PATH`. The recovery
-anchor is embedded in the hashed dispatcher. It is never the normal runtime.
+anchor is embedded in both hashed stable wrappers. It is never the normal runtime.
 
-If and only if `node-current` is broken, the dispatcher invokes the deployed
-controller with the recovery Node and the `runtime-repin` action. The controller
-then:
+The Homebrew installation transaction is an explicit trust authority. The
+harness does not independently attest Node provenance, whether Homebrew used a
+bottle or a source build. Runtime qualification proves Pi/Gondolin compatibility;
+it does not prove the authenticity or harmlessness of the Node interpreter that
+executes the qualification controller.
+
+If and only if `node-current/node` is broken, the wrapper invokes the deployed
+controller with the recovery Node and the `runtime-repin` action. It uses
+`/usr/bin/env -i` with an explicit allowlist containing only the deployment root,
+the required fixed system path, a private temporary directory, and the minimum
+home value required to locate the deployment. Provider credentials, tokens,
+project paths, prompts, and the caller's remaining environment are not inherited.
+The controller then:
 
 1. acquires the existing private update lock;
 2. validates ownership, modes, controller/runtime manifests, wrapper hashes,
-   release metadata, and the current release manifest without executing the
-   missing interpreter;
+   runtime-binding metadata, release metadata, and the current release manifest
+   without executing the missing interpreter;
 3. requires the recovery anchor to resolve to `process.execPath` and to a safe,
    canonical Homebrew Node executable;
-4. qualifies the current Pi release under that exact candidate interpreter,
+4. creates a new immutable binding generation without activating it;
+5. qualifies the current Pi release under that exact candidate interpreter,
    with the existing offline CLI, RPC refusal, license, sandbox, budget, and E2E
-   gates;
-5. atomically replaces `node-current` only after every gate passes.
+   gates, all under a minimal allowlisted environment;
+6. atomically replaces `node-current` only after every gate passes.
 
-The dispatcher then executes the original command through the newly pinned
-binding. A qualification failure leaves the broken binding unchanged and emits a
-stable refusal code. It never weakens the deployment or silently runs an
-unqualified interpreter.
+The wrapper then executes the original command through the newly pinned binding.
+A qualification failure leaves the active binding unchanged and emits a stable
+refusal code. Before activation, the candidate interpreter runs only the
+manifest-verified administrative controller and isolated Pi/Gondolin
+qualification workloads. It receives no user project mount, provider credential,
+prompt, or caller environment. This restricted execution relies on the explicit
+Homebrew trust assumption; it is not a sandbox against a malicious interpreter.
 
 `runtime-repin` does not fetch the latest Pi release and does not call
 `updateV3`. Runtime compatibility and Pi release compatibility remain separate
@@ -101,22 +140,43 @@ transactions.
 
 ### Existing v3 deployment adoption
 
-Running the source checkout's existing `install` action against a valid v3
-deployment with a direct Node path will perform a one-time controller adoption:
+Running the source checkout's existing `install` action against a v3 deployment
+with a direct Node path will perform a one-time controller adoption. It supports
+both a healthy direct Node and the original failure state where that exact keg no
+longer exists.
 
-1. stage the new controller, dispatcher, wrappers, state, and optional
-   `launchd` plist;
-2. validate their manifests and hashes;
-3. qualify the current release under the still-working pinned Node;
-4. commit the staged artifacts with rollback copies;
-5. create `node-current` pointing to the previously qualified exact Node;
-6. reload the `launchd` job and run the post-adoption smoke tests.
+For a broken deployment, the source controller first performs the same static
+ownership, manifest, wrapper-hash, link, release-metadata, and release-manifest
+checks used by recovery. It then treats its own canonical Homebrew interpreter as
+the candidate and qualifies the current release before adoption. It does not
+require the missing old Node to execute.
+
+Adoption will:
+
+1. acquire the update lock and stop the existing `launchd` job;
+2. stage the new controller, wrappers, state, first immutable runtime binding,
+   and optional `launchd` plist;
+3. validate their manifests and hashes;
+4. qualify the current release under the selected candidate Node;
+5. persist a private adoption journal containing only artifact names, hashes, and
+   transaction phase, then replace the staged artifacts;
+6. activate the first runtime binding with one atomic `node-current` switch;
+7. reload the `launchd` job and run the post-adoption smoke tests;
+8. mark the journal complete only after every post-adoption gate passes.
 
 The migration does not modify `current`, `previous`, or any release directory.
-On failure, all replaced deployment artifacts and the loaded `launchd` job are
-restored. The deployment state remains version 3 because its public shape and
-release semantics remain compatible; only `nodePath` changes from a direct
-executable to the deployment-owned binding.
+On a caught failure, all replaced deployment artifacts and the loaded `launchd`
+job are restored. On interruption or power loss, the next source `install`
+invocation detects the journal and deterministically completes or rolls back the
+recorded phase before attempting a new adoption. During any mixed phase the
+wrappers fail closed. The adoption is therefore crash-recoverable; only routine
+runtime promotion, which switches `node-current`, is a single-operation atomic
+transition.
+
+The deployment state remains version 3 because its public release semantics stay
+compatible, but it gains the explicit `runtimeBindingVersion: 1` capability
+marker. `nodePath` changes from a direct executable to the deployment-owned
+binding path.
 
 Fresh installs create this layout directly.
 
@@ -126,9 +186,15 @@ Fresh installs create this layout directly.
 - Recovery is allowed only when the qualified binding is broken.
 - The recovery Node must be under an accepted Homebrew Node keg and must match
   the fixed recovery anchor's canonical target.
+- Homebrew is an explicit interpreter-provenance trust authority; qualification
+  is a compatibility decision, not a substitute for supply-chain verification.
+- Recovery and every candidate child process receive a minimal allowlisted
+  environment with no provider or project secrets.
 - Controller and runtime manifests are verified before executing deployed
   recovery code.
 - The current Pi release is fully qualified before the atomic binding switch.
+- Each qualified binding leaves immutable, non-PII metadata and the previous
+  binding remains available as audit evidence.
 - No commands, project paths, prompts, secrets, or personal data are logged or
   persisted.
 - Direct RPC and incomplete-launcher refusals remain unchanged.
@@ -143,6 +209,8 @@ The controller will expose stable, non-sensitive refusal identifiers for:
 - recovery anchor/candidate mismatch;
 - attempted repin while the current binding is healthy;
 - current-release qualification failure;
+- recovery environment contamination;
+- incomplete adoption journal recovery;
 - adoption rollback failure.
 
 Shell entry points will map all recovery failures to the existing deployment
@@ -155,32 +223,41 @@ Implementation follows strict red-green TDD. Tests will cover:
 
 1. Homebrew recovery-anchor derivation for Apple Silicon, Intel, malformed, and
    unsupported paths;
-2. rendered wrappers and `launchd` configuration using `node-dispatch` without
-   embedding a versioned keg;
-3. healthy dispatch executing the existing pin without recovery;
+2. rendered wrappers and `launchd` configuration using `node-current` without
+   embedding a versioned keg or adding a dispatcher;
+3. healthy wrappers executing the existing pin without recovery, duplicate
+   hashing, or an extra shell;
 4. a broken old keg being replaced only after a passing qualification gate;
 5. a failing gate, unsafe symlink, mismatched recovery anchor, or healthy current
    pin leaving the binding unchanged;
-6. v3 adoption preserving `current`, `previous`, and release bytes;
-7. injected adoption failures restoring every replaced artifact;
-8. the original regression scenario: install with one fake Homebrew keg, remove
+6. recovery processes receiving an allowlisted environment with caller secrets
+   removed;
+7. healthy and already-broken v3 adoption preserving `current`, `previous`, and
+   release bytes;
+8. injected adoption failures restoring every replaced artifact, plus simulated
+   interruption at each journal phase followed by deterministic recovery;
+9. the original regression scenario: install with one fake Homebrew keg, remove
    it, expose a second keg through the stable recovery anchor, and successfully
    execute Pi through the repaired binding;
-9. the existing transactional updater coverage thresholds and full repository
+10. immutable binding metadata, state capability marking, retained prior audit
+    evidence, and zero persisted PII;
+11. the existing transactional updater coverage thresholds and full repository
    checks.
 
 The local installed deployment will be adopted only after repository tests,
 coverage, smoke tests, and a source review are green. Its post-deploy proof will
-include `deploymentStatusV3`, `pi --version`, direct-RPC refusal, and a forced
-runtime-repin rehearsal using isolated fixture paths rather than deleting a real
-Homebrew keg.
+include `deploymentStatusV3`, `pi --version`, direct-RPC refusal, and inspection
+of the active immutable runtime binding. Runtime-repin failure and recovery are
+proven end to end with isolated fixture paths; no real Homebrew keg is modified
+for a demonstration.
 
 ## Documentation
 
-The existing updater ADR will be amended with the runtime-binding decision and
-the reason the mutable Homebrew anchor is recovery-only. The Gondolin README will
-document normal behavior, explicit `runtime-repin`, refusal modes, and adoption
-of an existing v3 deployment.
+The existing updater ADR will be amended with the runtime-binding decision, the
+Homebrew trust assumption, the minimal recovery environment, and the reason the
+mutable Homebrew anchor is recovery-only. The Gondolin README will document
+normal behavior, explicit `runtime-repin`, refusal modes, audit metadata, and
+adoption of healthy or broken v3 deployments.
 
 ## Out of Scope
 
@@ -210,6 +287,13 @@ and security-update responsibilities disproportionate to the requested scope.
 
 ### Rewrite all wrappers after every Node upgrade
 
-This duplicates the current recovery script's multi-file transaction. A single
-deployment-owned symlink provides a smaller atomic state transition with fewer
-integrity surfaces.
+This duplicates the current recovery script's multi-file transaction. Immutable
+binding generations plus a single `node-current` switch provide a smaller atomic
+runtime state transition with fewer integrity surfaces.
+
+### Add a separate runtime dispatcher
+
+Only two stable wrappers need recovery behavior, and the `launchd` job can reuse
+the Pi wrapper. A dispatcher would add another shell `exec` and risk duplicate
+manifest verification on every healthy launch. The small recovery block is
+therefore duplicated explicitly until the rule of three justifies extraction.
