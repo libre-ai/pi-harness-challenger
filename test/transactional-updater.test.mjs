@@ -52,6 +52,16 @@ import {
   rollbackRelease,
   verifyCriticalManifest,
 } from "../experiments/gondolin/release-manager.mjs";
+import {
+  beginAuditOperation,
+  completeAuditOperation,
+  inspectAuditOperation,
+} from "../experiments/gondolin/operation-audit.mjs";
+import {
+  beginReleaseTransaction,
+  completeReleaseTransaction,
+  recoverReleaseTransaction,
+} from "../experiments/gondolin/release-transaction.mjs";
 
 function temporaryRoot(prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -237,7 +247,9 @@ async function runtimeLifecycleFixture() {
 
   const controllerFiles = [
     "deployment-controller.mjs",
+    "operation-audit.mjs",
     "release-manager.mjs",
+    "release-transaction.mjs",
     "runtime-adoption.mjs",
     "runtime-binding.mjs",
     "update-local.mjs",
@@ -360,6 +372,38 @@ test("static deployment validation accepts a missing qualified runtime without e
     assert.equal(status.staticIntegrityPassed, true);
     assert.equal(status.runtimeExecutable, false);
     assert.equal(fixture.executionCount(), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("read-only status reports an incomplete release transaction and audit", () => {
+  const fixture = staticDeploymentFixture();
+  try {
+    const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+    const current = readlinkSync(join(fixture.root, "current"));
+    const previous = readlinkSync(join(fixture.root, "previous"));
+    const audit = beginAuditOperation({
+      deploymentRoot: fixture.root,
+      action: "release-rollback",
+      trigger: "manual",
+      targetId: state.currentRelease,
+    });
+    beginReleaseTransaction({
+      deploymentRoot: fixture.root,
+      transactionId: audit.operationId,
+      kind: "rollback",
+      releaseId: state.currentRelease,
+      before: { state, current, previous },
+      after: { state, current, previous },
+    });
+
+    const status = deploymentStaticStatusV3({ home: fixture.home, deploymentRoot: fixture.root });
+    assert.equal(status.releaseTransactionIncomplete, true);
+    assert.equal(status.releaseTransactionSafe, true);
+    assert.equal(status.auditIncompleteOperations, 1);
+    assert.equal(status.auditTrailSafe, true);
+    assert.equal(status.staticIntegrityPassed, false);
   } finally {
     fixture.cleanup();
   }
@@ -1276,3 +1320,151 @@ test("un smoke post-activation en échec restaure exactement current et previous
     cleanup();
   }
 });
+
+test("release process crashes converge from every durable boundary", async (t) => {
+  const releaseTransactionUrl = new URL("../experiments/gondolin/release-transaction.mjs", import.meta.url).href;
+  const operationAuditUrl = new URL("../experiments/gondolin/operation-audit.mjs", import.meta.url).href;
+  const points = ["between-links", "links-written", "links-active", "qualified", "state-replaced", "state-active"];
+
+  for (const point of points) {
+    await t.test(point, () => {
+      const { root, cleanup } = temporaryRoot("pi-release-crash-");
+      const beforeState = { version: 3, currentRelease: "1.0.0-old", previousRelease: null };
+      const afterState = { version: 3, currentRelease: "2.0.0-new", previousRelease: "1.0.0-old" };
+      const before = { state: beforeState, current: "releases/1.0.0-old", previous: null };
+      const after = { state: afterState, current: "releases/2.0.0-new", previous: "releases/1.0.0-old" };
+      mkdirSync(join(root, "releases", "1.0.0-old"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(root, "candidates", "2.0.0-new"), { recursive: true, mode: 0o700 });
+      symlinkSync(before.current, join(root, "current"));
+      writeFileSync(join(root, "deployment.json"), `${JSON.stringify(beforeState, null, 2)}\n`, { mode: 0o600 });
+      const childSource = releaseCrashChildSource({
+        releaseTransactionUrl,
+        operationAuditUrl,
+        before,
+        after,
+        point,
+        kind: "promotion",
+      });
+      try {
+        const child = spawnSync(
+          process.execPath,
+          ["--input-type=module", "--eval", childSource, root],
+          { encoding: "utf8" },
+        );
+        assert.equal(child.status, 0, child.stderr);
+        const operationId = readFileSync(join(root, "operation-id"), "utf8");
+        assert.equal(inspectAuditOperation({ deploymentRoot: root, operationId }).complete, false);
+        const recovered = recoverReleaseTransaction({ deploymentRoot: root });
+        const completes = ["qualified", "state-replaced", "state-active"].includes(point);
+        assert.equal(recovered.action, completes ? "complete" : "rollback");
+        completeAuditOperation({
+          deploymentRoot: root,
+          operationId,
+          outcome: "recovered",
+          errorCode: null,
+        });
+        completeReleaseTransaction({ deploymentRoot: root, transactionId: operationId });
+        assert.equal(readlinkSync(join(root, "current")), completes ? after.current : before.current);
+        assert.equal(existsSync(join(root, "previous")) ? readlinkSync(join(root, "previous")) : null, completes ? after.previous : before.previous);
+        assert.deepEqual(JSON.parse(readFileSync(join(root, "deployment.json"), "utf8")), completes ? afterState : beforeState);
+        assert.equal(existsSync(join(root, "releases", "2.0.0-new")), completes);
+        assert.equal(existsSync(join(root, "candidates", "2.0.0-new")), !completes);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+});
+
+test("rollback process crashes converge before and after durable qualification", async (t) => {
+  const releaseTransactionUrl = new URL("../experiments/gondolin/release-transaction.mjs", import.meta.url).href;
+  const operationAuditUrl = new URL("../experiments/gondolin/operation-audit.mjs", import.meta.url).href;
+  for (const point of ["between-links", "qualified"]) {
+    await t.test(point, () => {
+      const { root, cleanup } = temporaryRoot("pi-rollback-crash-");
+      const beforeState = { version: 3, currentRelease: "2.0.0-new", previousRelease: "1.0.0-old" };
+      const afterState = { version: 3, currentRelease: "1.0.0-old", previousRelease: "2.0.0-new" };
+      const before = { state: beforeState, current: "releases/2.0.0-new", previous: "releases/1.0.0-old" };
+      const after = { state: afterState, current: "releases/1.0.0-old", previous: "releases/2.0.0-new" };
+      mkdirSync(join(root, "releases", "1.0.0-old"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(root, "releases", "2.0.0-new"), { recursive: true, mode: 0o700 });
+      symlinkSync(before.current, join(root, "current"));
+      symlinkSync(before.previous, join(root, "previous"));
+      writeFileSync(join(root, "deployment.json"), `${JSON.stringify(beforeState, null, 2)}\n`, { mode: 0o600 });
+      const childSource = releaseCrashChildSource({
+        releaseTransactionUrl,
+        operationAuditUrl,
+        before,
+        after,
+        point,
+        kind: "rollback",
+      });
+      try {
+        const child = spawnSync(
+          process.execPath,
+          ["--input-type=module", "--eval", childSource, root],
+          { encoding: "utf8" },
+        );
+        assert.equal(child.status, 0, child.stderr);
+        const operationId = readFileSync(join(root, "operation-id"), "utf8");
+        const recovered = recoverReleaseTransaction({ deploymentRoot: root });
+        const completes = point === "qualified";
+        assert.equal(recovered.action, completes ? "complete" : "rollback");
+        completeAuditOperation({ deploymentRoot: root, operationId, outcome: "recovered", errorCode: null });
+        completeReleaseTransaction({ deploymentRoot: root, transactionId: operationId });
+        assert.equal(readlinkSync(join(root, "current")), completes ? after.current : before.current);
+        assert.equal(readlinkSync(join(root, "previous")), completes ? after.previous : before.previous);
+        assert.deepEqual(JSON.parse(readFileSync(join(root, "deployment.json"), "utf8")), completes ? afterState : beforeState);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+});
+
+function releaseCrashChildSource({ releaseTransactionUrl, operationAuditUrl, before, after, point, kind }) {
+  return `
+    import { renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { beginAuditOperation } from ${JSON.stringify(operationAuditUrl)};
+    import { advanceReleaseTransaction, beginReleaseTransaction } from ${JSON.stringify(releaseTransactionUrl)};
+    const root = process.argv[1];
+    const before = ${JSON.stringify(before)};
+    const after = ${JSON.stringify(after)};
+    const audit = beginAuditOperation({
+      deploymentRoot: root,
+      action: ${JSON.stringify(kind === "promotion" ? "release-update" : "release-rollback")},
+      trigger: "manual",
+      targetId: ${JSON.stringify(kind === "promotion" ? "2.0.0-new" : "1.0.0-old")},
+    });
+    writeFileSync(join(root, "operation-id"), audit.operationId, { mode: 0o600 });
+    beginReleaseTransaction({
+      deploymentRoot: root,
+      transactionId: audit.operationId,
+      kind: ${JSON.stringify(kind)},
+      releaseId: ${JSON.stringify(kind === "promotion" ? "2.0.0-new" : "1.0.0-old")},
+      candidateId: ${JSON.stringify(kind === "promotion" ? "2.0.0-new" : null)},
+      before,
+      after,
+    });
+    if (${JSON.stringify(kind)} === "promotion") {
+      renameSync(join(root, "candidates", "2.0.0-new"), join(root, "releases", "2.0.0-new"));
+    }
+    rmSync(join(root, "previous"), { force: true });
+    symlinkSync(after.previous, join(root, "previous"));
+    if (${JSON.stringify(point)} === "between-links") process.exit(0);
+    rmSync(join(root, "current"));
+    symlinkSync(after.current, join(root, "current"));
+    if (${JSON.stringify(point)} === "links-written") process.exit(0);
+    advanceReleaseTransaction({ deploymentRoot: root, expectedPhase: "prepared", nextPhase: "links-active" });
+    if (${JSON.stringify(point)} === "links-active") process.exit(0);
+    advanceReleaseTransaction({ deploymentRoot: root, expectedPhase: "links-active", nextPhase: "qualified" });
+    if (${JSON.stringify(point)} === "qualified") process.exit(0);
+    const temporaryState = join(root, "deployment.json.next");
+    writeFileSync(temporaryState, JSON.stringify(after.state, null, 2) + "\\n", { mode: 0o600 });
+    renameSync(temporaryState, join(root, "deployment.json"));
+    if (${JSON.stringify(point)} === "state-replaced") process.exit(0);
+    advanceReleaseTransaction({ deploymentRoot: root, expectedPhase: "qualified", nextPhase: "state-active" });
+    process.exit(0);
+  `;
+}

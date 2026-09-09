@@ -296,6 +296,7 @@ export function beginReleaseTransaction({
   kind,
   releaseId,
   candidateId = null,
+  transactionId = randomUUID(),
   before,
   after,
 }) {
@@ -306,7 +307,7 @@ export function beginReleaseTransaction({
   const afterState = serializeState(after?.state);
   const journal = validateJournal({
     version: RELEASE_TRANSACTION_VERSION,
-    transactionId: randomUUID(),
+    transactionId,
     kind,
     phase: "prepared",
     releaseId,

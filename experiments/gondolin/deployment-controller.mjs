@@ -2,10 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   cpSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -40,6 +43,20 @@ import {
   beginRuntimeAdoption,
   recoverRuntimeAdoption,
 } from "./runtime-adoption.mjs";
+import {
+  auditStatus,
+  beginAuditOperation,
+  completeAuditOperation,
+  inspectAuditOperation,
+  pruneCompletedAuditOperations,
+} from "./operation-audit.mjs";
+import {
+  advanceReleaseTransaction,
+  beginReleaseTransaction,
+  completeReleaseTransaction,
+  inspectReleaseTransaction,
+  recoverReleaseTransaction,
+} from "./release-transaction.mjs";
 
 const DEPLOYMENT_VERSION = 3;
 const LAUNCH_AGENT_LABEL = "dev.pi-gondolin.transactional-update";
@@ -105,15 +122,32 @@ function ensureOwnedDirectoryPreservingMode(path, createMode = 0o700) {
 
 function atomicWrite(path, content, mode = 0o600) {
   const temporaryPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temporaryPath, content, { flag: "wx", mode });
+  const descriptor = openSync(temporaryPath, "wx", mode);
+  try {
+    writeFileSync(descriptor, content);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
   renameSync(temporaryPath, path);
   chmodSync(path, mode);
+  fsyncDirectory(dirname(path));
 }
 
 function atomicSymlink(target, path) {
   const temporaryPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
   symlinkSync(target, temporaryPath);
   renameSync(temporaryPath, path);
+  fsyncDirectory(dirname(path));
+}
+
+function fsyncDirectory(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function readOwnedJson(path) {
@@ -479,7 +513,9 @@ function copyRuntime(projectRoot, stagingRoot) {
   const runtimeRoot = join(controllerRoot, "runtime");
   ensureOwnedDirectory(controllerRoot);
   ensureOwnedDirectory(runtimeRoot);
+  cpSync(join(projectRoot, "experiments", "gondolin", "operation-audit.mjs"), join(controllerRoot, "operation-audit.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "release-manager.mjs"), join(controllerRoot, "release-manager.mjs"));
+  cpSync(join(projectRoot, "experiments", "gondolin", "release-transaction.mjs"), join(controllerRoot, "release-transaction.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "runtime-adoption.mjs"), join(controllerRoot, "runtime-adoption.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "runtime-binding.mjs"), join(controllerRoot, "runtime-binding.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "deployment-controller.mjs"), join(controllerRoot, "deployment-controller.mjs"));
@@ -501,7 +537,9 @@ function copyRuntime(projectRoot, stagingRoot) {
 
   const controllerFiles = [
     "controller/deployment-controller.mjs",
+    "controller/operation-audit.mjs",
     "controller/release-manager.mjs",
+    "controller/release-transaction.mjs",
     "controller/runtime-adoption.mjs",
     "controller/runtime-binding.mjs",
     "controller/update-local.mjs",
@@ -778,7 +816,9 @@ function adoptionArtifacts(oldDigests, newDigests) {
 function adoptionControllerFiles() {
   return [
     "controller/deployment-controller.mjs",
+    "controller/operation-audit.mjs",
     "controller/release-manager.mjs",
+    "controller/release-transaction.mjs",
     "controller/runtime-adoption.mjs",
     "controller/runtime-binding.mjs",
     "controller/update-local.mjs",
@@ -789,7 +829,9 @@ function stageAdoptionController({ projectRoot, deploymentRoot, stagingRoot }) {
   cpSync(join(deploymentRoot, "controller"), join(stagingRoot, "controller"), { recursive: true });
   for (const file of [
     "deployment-controller.mjs",
+    "operation-audit.mjs",
     "release-manager.mjs",
+    "release-transaction.mjs",
     "runtime-adoption.mjs",
     "runtime-binding.mjs",
     "update-local.mjs",
@@ -1271,6 +1313,22 @@ function runtimeConfigurationStatus(paths, state) {
 
 export function deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
+  let releaseTransactionIncomplete = false;
+  let releaseTransactionSafe = true;
+  let auditIncompleteOperations = 0;
+  let auditTrailSafe = true;
+  try {
+    releaseTransactionIncomplete = inspectReleaseTransaction({ deploymentRoot: paths.deploymentRoot }) !== null;
+  } catch {
+    releaseTransactionIncomplete = true;
+    releaseTransactionSafe = false;
+  }
+  try {
+    auditIncompleteOperations = auditStatus({ deploymentRoot: paths.deploymentRoot }).incomplete;
+  } catch {
+    auditIncompleteOperations = -1;
+    auditTrailSafe = false;
+  }
   let state;
   let releaseRoot;
   try {
@@ -1284,6 +1342,10 @@ export function deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot })
       wrapperHashesMatched: false,
       runtimeConfigurationMatched: false,
       runtimeExecutable: false,
+      releaseTransactionIncomplete,
+      releaseTransactionSafe,
+      auditIncompleteOperations,
+      auditTrailSafe,
       staticIntegrityPassed: false,
     };
   }
@@ -1312,12 +1374,18 @@ export function deploymentStaticStatusV3({ home, deploymentRoot: overrideRoot })
     wrappersInstalled,
     wrapperHashesMatched,
     ...runtimeStatus,
+    releaseTransactionIncomplete,
+    releaseTransactionSafe,
+    auditIncompleteOperations,
+    auditTrailSafe,
     staticIntegrityPassed: controllerManifestMatched
       && runtimeManifestMatched
       && currentReleaseMatched
       && wrappersInstalled
       && wrapperHashesMatched
-      && runtimeStatus.runtimeConfigurationMatched,
+      && runtimeStatus.runtimeConfigurationMatched
+      && releaseTransactionSafe
+      && !releaseTransactionIncomplete,
   };
 }
 
@@ -1563,34 +1631,127 @@ function removeOwnedCandidate(candidateRoot, candidatesRoot) {
   rmSync(candidateRoot, { recursive: true });
 }
 
+function copyDeploymentState(state) {
+  return JSON.parse(JSON.stringify(state));
+}
+
+function optionalReleaseLink(path) {
+  if (!existsSync(path)) return null;
+  const stats = lstatSync(path);
+  if (!stats.isSymbolicLink() || !isOwned(stats)) throw new Error("release-link-unsafe");
+  const target = readlinkSync(path);
+  if (!target.startsWith("releases/") || basename(target) !== target.slice("releases/".length)) {
+    throw new Error("release-link-unsafe");
+  }
+  return target;
+}
+
+function releaseTransactionSnapshot(paths, state) {
+  return {
+    state: copyDeploymentState(state),
+    current: optionalReleaseLink(join(paths.deploymentRoot, "current")),
+    previous: optionalReleaseLink(join(paths.deploymentRoot, "previous")),
+  };
+}
+
+function stableAuditError(error) {
+  const code = error instanceof Error ? error.message : "unknown";
+  return /^[a-z0-9][a-z0-9:-]{0,127}$/.test(code) ? code : "unknown";
+}
+
+function finishReleaseAudit(paths, operationId, outcome, errorCode) {
+  const result = completeAuditOperation({
+    deploymentRoot: paths.deploymentRoot,
+    operationId,
+    outcome,
+    errorCode,
+  });
+  if (result.auditComplete) {
+    try {
+      pruneCompletedAuditOperations({ deploymentRoot: paths.deploymentRoot });
+    } catch {
+      // Unsafe evidence is retained rather than deleted; the operation result
+      // itself remains durable and truthful.
+    }
+  }
+  return result;
+}
+
+function recoverPendingReleaseTransaction(paths) {
+  const transaction = inspectReleaseTransaction({ deploymentRoot: paths.deploymentRoot });
+  if (transaction === null) return { recovered: false, auditComplete: true };
+  const recovered = recoverReleaseTransaction({ deploymentRoot: paths.deploymentRoot });
+  const existingAudit = inspectAuditOperation({
+    deploymentRoot: paths.deploymentRoot,
+    operationId: transaction.journal.transactionId,
+  });
+  const expectedAction = transaction.journal.kind === "promotion" ? "release-update" : "release-rollback";
+  const allowedOutcomes = recovered.action === "rollback"
+    ? new Set(["refused", "recovered"])
+    : new Set(["succeeded", "recovered"]);
+  if (existingAudit.action !== expectedAction
+    || existingAudit.targetId !== transaction.journal.releaseId
+    || (existingAudit.complete && !allowedOutcomes.has(existingAudit.outcome))) {
+    throw new Error("release-transaction-audit-mismatch");
+  }
+  const audit = existingAudit.complete
+    ? { operationId: existingAudit.operationId, auditComplete: true }
+    : finishReleaseAudit(paths, existingAudit.operationId, "recovered", null);
+  if (!audit.auditComplete) return { recovered: true, auditComplete: false, ...recovered };
+  completeReleaseTransaction({
+    deploymentRoot: paths.deploymentRoot,
+    transactionId: transaction.journal.transactionId,
+  });
+  return { recovered: true, auditComplete: true, ...recovered };
+}
+
 export async function updateV3({ home, deploymentRoot: overrideRoot, force = false, updateExtensions = false }) {
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
   let state;
   let attemptedReleaseId;
+  let audit = null;
+  let transactionStarted = false;
+  let currentRelease;
+  let release;
+  let promotionResult;
   try {
+    const recovered = recoverPendingReleaseTransaction(paths);
+    if (!recovered.auditComplete) throw new Error("release-transaction-audit-incomplete");
     ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
     const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const status = deploymentStatusV3({ home, deploymentRoot: overrideRoot });
     if (!status.deployed) throw new Error("deployment-pre-update-invalid");
     const current = stateAndCurrent(paths);
     state = current.state;
-    const currentRelease = current.release;
+    currentRelease = current.release;
     const latestPayload = await fetchLatestRelease();
     const validatedTarget = parseLatestRelease(latestPayload, "sha512-AA==");
     const preliminaryVersionOrder = compareVersions(validatedTarget.version, currentRelease.packageVersion);
     if (preliminaryVersionOrder < 0) throw new Error("release-downgrade-refused");
     if (preliminaryVersionOrder === 0 && !force) {
       updateExtensionsIfRequested(paths, updateExtensions);
-      return { updated: false, currentVersion: currentRelease.packageVersion, reason: "already-current" };
+      return {
+        updated: false,
+        currentVersion: currentRelease.packageVersion,
+        reason: "already-current",
+        operationId: null,
+        auditComplete: true,
+      };
     }
     const integrity = resolveRegistryIntegrity(state, validatedTarget.packageName, validatedTarget.version);
-    const release = parseLatestRelease(latestPayload, integrity);
+    release = parseLatestRelease(latestPayload, integrity);
     const releaseId = releaseIdFor(release);
     attemptedReleaseId = releaseId;
     if (state.blockedRelease?.releaseId === releaseId && !force) {
       updateExtensionsIfRequested(paths, updateExtensions);
-      return { updated: false, currentVersion: currentRelease.packageVersion, reason: "candidate-previously-refused" };
+      return {
+        updated: false,
+        currentVersion: currentRelease.packageVersion,
+        reason: "candidate-previously-refused",
+        operationId: null,
+        auditComplete: true,
+      };
     }
     if (releaseId === currentReleaseId(paths) && force) {
       const currentRoot = currentReleaseRoot(paths.deploymentRoot);
@@ -1602,7 +1763,13 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
         environment,
       })) throw new Error("current-release-requalification-refused");
       updateExtensionsIfRequested(paths, updateExtensions);
-      return { updated: false, currentVersion: release.version, reason: "requalified-current" };
+      return {
+        updated: false,
+        currentVersion: release.version,
+        reason: "requalified-current",
+        operationId: null,
+        auditComplete: true,
+      };
     }
     if (existsSync(join(paths.deploymentRoot, "releases", releaseId))) throw new Error("release-already-exists");
     const candidatesRoot = join(paths.deploymentRoot, "candidates");
@@ -1610,7 +1777,33 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
     ensureOwnedDirectory(candidatesRoot);
     removeOwnedCandidate(candidateRoot, candidatesRoot);
     installCandidatePackage(state, candidateRoot, release);
-    const result = await promoteCandidate({
+    const before = releaseTransactionSnapshot(paths, state);
+    const nextState = copyDeploymentState(state);
+    nextState.currentRelease = releaseId;
+    nextState.previousRelease = state.currentRelease;
+    delete nextState.blockedRelease;
+    const after = {
+      state: nextState,
+      current: `releases/${releaseId}`,
+      previous: before.current,
+    };
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "release-update",
+      trigger: "manual",
+      targetId: releaseId,
+    });
+    beginReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      transactionId: audit.operationId,
+      kind: "promotion",
+      releaseId,
+      candidateId: releaseId,
+      before,
+      after,
+    });
+    transactionStarted = true;
+    promotionResult = await promoteCandidate({
       deploymentRoot: paths.deploymentRoot,
       candidatePath: candidateRoot,
       releaseId,
@@ -1627,21 +1820,65 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
         },
       ],
       postActivationGate: async () => postActivationSmoke(paths, release.version, environment),
+      onLinksActive: async () => advanceReleaseTransaction({
+        deploymentRoot: paths.deploymentRoot,
+        expectedPhase: "prepared",
+        nextPhase: "links-active",
+      }),
+      onQualified: async () => advanceReleaseTransaction({
+        deploymentRoot: paths.deploymentRoot,
+        expectedPhase: "links-active",
+        nextPhase: "qualified",
+      }),
     });
-    const previousRelease = state.currentRelease;
-    state.currentRelease = releaseId;
-    state.previousRelease = previousRelease;
-    delete state.blockedRelease;
-    try {
-      writeOwnedJson(paths.statePath, state);
-    } catch {
-      rollbackRelease(paths.deploymentRoot);
-      throw new Error("deployment-state-update-refused");
+    writeOwnedJson(paths.statePath, nextState);
+    advanceReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "qualified",
+      nextPhase: "state-active",
+    });
+    const auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    if (auditResult.auditComplete) {
+      completeReleaseTransaction({ deploymentRoot: paths.deploymentRoot, transactionId: audit.operationId });
+      transactionStarted = false;
     }
     updateExtensionsIfRequested(paths, updateExtensions);
-    return { updated: true, fromVersion: currentRelease.packageVersion, toVersion: release.version, ...result };
+    return {
+      updated: true,
+      fromVersion: currentRelease.packageVersion,
+      toVersion: release.version,
+      ...promotionResult,
+      operationId: audit.operationId,
+      auditComplete: auditResult.auditComplete,
+    };
   } catch (error) {
     const code = error instanceof Error ? error.message : "unknown";
+    if (transactionStarted && audit !== null) {
+      const recovered = recoverReleaseTransaction({ deploymentRoot: paths.deploymentRoot });
+      const auditResult = finishReleaseAudit(
+        paths,
+        audit.operationId,
+        recovered.action === "rollback" ? "refused" : "recovered",
+        recovered.action === "rollback" ? stableAuditError(error) : null,
+      );
+      if (auditResult.auditComplete) {
+        completeReleaseTransaction({ deploymentRoot: paths.deploymentRoot, transactionId: audit.operationId });
+        transactionStarted = false;
+      }
+      if (recovered.action === "complete") {
+        return {
+          updated: true,
+          recovered: true,
+          fromVersion: currentRelease.packageVersion,
+          toVersion: release.version,
+          ...(promotionResult ?? { activated: true, releaseId: attemptedReleaseId, gates: [] }),
+          operationId: audit.operationId,
+          auditComplete: auditResult.auditComplete,
+        };
+      }
+    } else if (audit !== null) {
+      finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+    }
     if (state && attemptedReleaseId && (code.startsWith("qualification-gate-refused:") || code === "post-activation-gate-refused")) {
       state.blockedRelease = { releaseId: attemptedReleaseId, reason: "compatibility-gate-refused" };
       try {
@@ -1659,22 +1896,97 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
 export function rollbackV3({ home, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  let audit = null;
+  let transactionStarted = false;
+  let rollbackResult;
+  let current;
   try {
+    const recovered = recoverPendingReleaseTransaction(paths);
+    if (!recovered.auditComplete) throw new Error("release-transaction-audit-incomplete");
     ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
     const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
     const { state } = stateAndCurrent(paths);
-    const result = rollbackRelease(paths.deploymentRoot);
-    const currentRoot = currentReleaseRoot(paths.deploymentRoot);
-    const current = readReleaseMetadata(currentRoot);
+    const before = releaseTransactionSnapshot(paths, state);
+    if (before.previous === null) throw new Error("rollback-release-unavailable");
+    const targetReleaseId = basename(before.previous);
+    current = readReleaseMetadata(join(paths.deploymentRoot, before.previous));
+    const nextState = copyDeploymentState(state);
+    nextState.currentRelease = targetReleaseId;
+    nextState.previousRelease = basename(before.current);
+    nextState.blockedRelease = { releaseId: nextState.previousRelease, reason: "manual-rollback" };
+    const after = { state: nextState, current: before.previous, previous: before.current };
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "release-rollback",
+      trigger: "manual",
+      targetId: targetReleaseId,
+    });
+    beginReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      transactionId: audit.operationId,
+      kind: "rollback",
+      releaseId: targetReleaseId,
+      before,
+      after,
+    });
+    transactionStarted = true;
+    rollbackResult = rollbackRelease(paths.deploymentRoot);
+    advanceReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "prepared",
+      nextPhase: "links-active",
+    });
     if (!postActivationSmoke(paths, current.packageVersion, environment)) {
-      rollbackRelease(paths.deploymentRoot);
       throw new Error("rollback-post-activation-refused");
     }
-    state.currentRelease = result.current;
-    state.previousRelease = result.previous;
-    state.blockedRelease = { releaseId: result.previous, reason: "manual-rollback" };
-    writeOwnedJson(paths.statePath, state);
-    return { ...result, currentVersion: current.packageVersion };
+    advanceReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "links-active",
+      nextPhase: "qualified",
+    });
+    writeOwnedJson(paths.statePath, nextState);
+    advanceReleaseTransaction({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "qualified",
+      nextPhase: "state-active",
+    });
+    const auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    if (auditResult.auditComplete) {
+      completeReleaseTransaction({ deploymentRoot: paths.deploymentRoot, transactionId: audit.operationId });
+      transactionStarted = false;
+    }
+    return {
+      ...rollbackResult,
+      currentVersion: current.packageVersion,
+      operationId: audit.operationId,
+      auditComplete: auditResult.auditComplete,
+    };
+  } catch (error) {
+    if (transactionStarted && audit !== null) {
+      const recovered = recoverReleaseTransaction({ deploymentRoot: paths.deploymentRoot });
+      const auditResult = finishReleaseAudit(
+        paths,
+        audit.operationId,
+        recovered.action === "rollback" ? "refused" : "recovered",
+        recovered.action === "rollback" ? stableAuditError(error) : null,
+      );
+      if (auditResult.auditComplete) {
+        completeReleaseTransaction({ deploymentRoot: paths.deploymentRoot, transactionId: audit.operationId });
+        transactionStarted = false;
+      }
+      if (recovered.action === "complete") {
+        return {
+          ...rollbackResult,
+          recovered: true,
+          currentVersion: current.packageVersion,
+          operationId: audit.operationId,
+          auditComplete: auditResult.auditComplete,
+        };
+      }
+    } else if (audit !== null) {
+      finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+    }
+    throw error;
   } finally {
     releaseLock();
   }

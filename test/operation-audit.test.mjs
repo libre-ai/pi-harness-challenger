@@ -18,6 +18,7 @@ import {
   auditStatus,
   beginAuditOperation,
   completeAuditOperation,
+  inspectAuditOperation,
   pruneCompletedAuditOperations,
 } from "../experiments/gondolin/operation-audit.mjs";
 
@@ -51,6 +52,15 @@ test("audit operation persists exact immutable private records", () => {
       trigger: "manual",
       targetId: "2.0.0-new",
       startedAt: "2026-09-09T10:00:00.000Z",
+    });
+    assert.deepEqual(inspectAuditOperation({ deploymentRoot: root, operationId: started.operationId }), {
+      operationId: started.operationId,
+      action: "release-update",
+      trigger: "manual",
+      targetId: "2.0.0-new",
+      complete: false,
+      outcome: null,
+      errorCode: null,
     });
     const completed = completeAuditOperation({
       deploymentRoot: root,

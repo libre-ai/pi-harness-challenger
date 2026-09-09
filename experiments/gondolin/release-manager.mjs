@@ -378,6 +378,10 @@ export async function promoteCandidate({
   releaseId,
   qualificationGates,
   postActivationGate,
+  afterPreviousLink,
+  afterCurrentLink,
+  onLinksActive,
+  onQualified,
 }) {
   validateReleaseId(releaseId);
   ensureOwnedDirectory(join(deploymentRoot, "releases"));
@@ -411,27 +415,32 @@ export async function promoteCandidate({
 
   const finalPath = join(deploymentRoot, "releases", releaseId);
   if (lstatExists(finalPath)) throw new Error("release-already-exists");
-  renameSync(candidatePath, finalPath);
-  atomicSymlink(originalCurrent, previousPath);
-  atomicSymlink(`releases/${releaseId}`, currentPath);
-
-  let postActivationPassed = false;
   try {
-    postActivationPassed = await postActivationGate(finalPath) === true;
-  } catch {
-    postActivationPassed = false;
-  }
-  if (!postActivationPassed) {
+    renameSync(candidatePath, finalPath);
+    atomicSymlink(originalCurrent, previousPath);
+    afterPreviousLink?.();
+    atomicSymlink(`releases/${releaseId}`, currentPath);
+    afterCurrentLink?.();
+    if (onLinksActive !== undefined) await onLinksActive();
+    let postActivationPassed = false;
+    try {
+      postActivationPassed = await postActivationGate(finalPath) === true;
+    } catch {
+      postActivationPassed = false;
+    }
+    if (!postActivationPassed) throw new Error("post-activation-gate-refused");
+    if (onQualified !== undefined) await onQualified();
+  } catch (error) {
     restoreLink(currentPath, originalCurrent);
     restoreLink(previousPath, originalPrevious);
-    renameSync(finalPath, candidatePath);
-    throw new Error("post-activation-gate-refused");
+    if (lstatExists(finalPath)) renameSync(finalPath, candidatePath);
+    throw error;
   }
 
   return { activated: true, releaseId, gates: passedGates };
 }
 
-export function rollbackRelease(deploymentRoot) {
+export function rollbackRelease(deploymentRoot, { afterCurrentLink, afterPreviousLink } = {}) {
   const currentPath = join(deploymentRoot, "current");
   const previousPath = join(deploymentRoot, "previous");
   const current = readOptionalSafeLink(currentPath);
@@ -443,6 +452,8 @@ export function rollbackRelease(deploymentRoot) {
   const stats = statSync(previousRelease);
   if (!stats.isDirectory() || !isOwned(stats)) throw new Error("rollback-release-unsafe");
   atomicSymlink(previous, currentPath);
+  afterCurrentLink?.();
   atomicSymlink(current, previousPath);
+  afterPreviousLink?.();
   return { rolledBack: true, current: previous.slice("releases/".length), previous: current.slice("releases/".length) };
 }

@@ -322,6 +322,21 @@ export function auditStatus({ deploymentRoot }) {
   };
 }
 
+export function inspectAuditOperation({ deploymentRoot, operationId }) {
+  requirePrivateDirectory(deploymentRoot, "audit-deployment-directory-unsafe");
+  const { operationsRoot } = auditPaths(deploymentRoot);
+  const operation = readOperation(operationsRoot, operationId);
+  return {
+    operationId,
+    action: operation.started.action,
+    trigger: operation.started.trigger,
+    targetId: operation.started.targetId,
+    complete: operation.result !== null,
+    outcome: operation.result?.outcome ?? null,
+    errorCode: operation.result?.errorCode ?? null,
+  };
+}
+
 export function pruneCompletedAuditOperations({ deploymentRoot }) {
   const completed = readAllOperations(deploymentRoot)
     .filter((operation) => operation.result !== null)
