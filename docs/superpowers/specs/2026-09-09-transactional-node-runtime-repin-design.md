@@ -55,7 +55,9 @@ Previous binding generations are retained as non-sensitive qualification evidenc
 `deployment.json.nodePath` and the Node prefix of `npmCommand` reference
 `node-current/node` rather than the Homebrew keg directly. An explicit
 `runtimeBindingVersion: 1` state marker prevents old and new `nodePath` semantics
-from being inferred from path shape.
+from being inferred from path shape. `deployment.json.nodeRecoveryPath` records
+the fixed Homebrew recovery anchor rendered into the wrappers so explicit and
+automatic recovery enforce the same authority.
 
 The active binding remains exact: its inner symlink target is a canonical keg
 path, not the mutable Homebrew `opt` link. Switching interpreters consists of one
@@ -119,7 +121,8 @@ The controller then:
    runtime-binding metadata, release metadata, and the current release manifest
    without executing the missing interpreter;
 3. requires the recovery anchor to resolve to `process.execPath` and to a safe,
-   canonical Homebrew Node executable;
+   canonical Homebrew Node executable, and requires it to equal the state's
+   `nodeRecoveryPath`;
 4. creates a new immutable binding generation without activating it;
 5. qualifies the current Pi release under that exact candidate interpreter,
    with the existing offline CLI, RPC refusal, license, sandbox, budget, and E2E
@@ -175,8 +178,8 @@ transition.
 
 The deployment state remains version 3 because its public release semantics stay
 compatible, but it gains the explicit `runtimeBindingVersion: 1` capability
-marker. `nodePath` changes from a direct executable to the deployment-owned
-binding path.
+marker and `nodeRecoveryPath`. `nodePath` changes from a direct executable to the
+deployment-owned binding path.
 
 Fresh installs create this layout directly.
 
