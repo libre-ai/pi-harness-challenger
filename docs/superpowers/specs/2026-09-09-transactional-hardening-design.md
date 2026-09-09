@@ -270,10 +270,17 @@ Allowed fields are restricted to:
 - a sanitized stable error code.
 
 A missing result is durable evidence of interruption. The controller refuses
-to mutate if the start record cannot be persisted. A result-write failure
-leaves the start record intact and reports `audit-result-write-refused` rather
-than claiming an audited success. Release transaction recovery writes its
-idempotent result before completing the journal.
+to mutate if the start record cannot be persisted. Release transactions write
+their idempotent audit result before completing the journal, so recovery can
+finish both together.
+
+For an already-completed atomic mutation that cannot safely be rolled back,
+an audit-result write failure must not turn an applied change into a reported
+operational failure. The command returns the real mutation result together
+with `auditComplete: false`, and read-only status continues to expose the
+incomplete operation. A normal audited success returns `auditComplete: true`.
+This separates operational truth from compliance evidence without silently
+accepting the missing evidence.
 
 Retention is 256 completed operations. Pruning removes only validated,
 owned, private completed operation directories in timestamp order. Incomplete
@@ -388,7 +395,7 @@ New errors remain stable non-sensitive identifiers:
 - `release-transaction-*-invalid`, `release-transaction-state-unsafe`;
 - `release-tree-entry-unsafe`, `release-manifest-incomplete`;
 - `child-environment-missing`;
-- `audit-*-unsafe`, `audit-result-write-refused`;
+- `audit-*-unsafe`, `audit-start-write-refused`;
 - `release-descriptor-too-large`, `release-descriptor-media-type-refused`;
 - `supply-chain-policy-invalid`; and
 - `deployment-controller-revision-invalid`.
@@ -438,7 +445,8 @@ The ADR and operator README will state:
 6. Sentinel secrets never reach administrative child processes or audit data.
 7. Revision-2 deployment state contains no home-directory path.
 8. Every mutating command leaves a start audit record and a result or visible
-   interruption record.
+   interruption record; an applied atomic mutation reports its real result and
+   `auditComplete: false` when final audit persistence fails.
 9. Oversized or redirected update metadata is refused before parsing or npm
    execution.
 10. `npm audit --omit=dev`, unit tests, coverage, E2E, deployment status, and
