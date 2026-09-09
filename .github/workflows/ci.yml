@@ -12,10 +12,9 @@ name: CI
 #   test/eval-status.test.mjs       — assertions sur l'état des rapports
 #                                     d'évaluation de la machine de l'owner
 #
-# 67 des 70 cas tournent ici. Les 3 autres restent owner-run, comme les smokes
-# de `npm run check` qui demandent une VM Gondolin et un déploiement
-# local attesté. Les inclure produirait un rouge permanent — c'est-à-dire un
-# gate qu'on apprend à ignorer.
+# Les fichiers exclus restent owner-run, comme les smokes de `npm run check`
+# qui demandent une VM Gondolin et un déploiement local attesté. Les inclure
+# produirait un rouge permanent — c'est-à-dire un gate qu'on apprend à ignorer.
 on:
   push:
     branches: [main]
@@ -36,13 +35,16 @@ jobs:
         with:
           node-version: '22.19.0'
 
+      - name: Install Gondolin dependencies
+        run: npm run setup:gondolin
+
       # Sans ce contrôle, un fichier de test ajouté plus tard ne serait jamais
       # exécuté ici et personne ne le remarquerait : la CI resterait verte en
       # couvrant moins. Le job échoue tant que la liste n'est pas remise à jour.
       - name: The runnable list still covers every test file
         run: |
           set -euo pipefail
-          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills transactional-updater"
+          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction runtime-adoption runtime-binding skills transactional-updater"
           excluded="eval-status sandbox-preflight"
           missing=0
           for f in test/*.test.mjs; do
@@ -73,8 +75,13 @@ jobs:
             test/policy-gate-hardening.test.mjs \
             test/policy-gate.test.mjs \
             test/policy-sandbox-friction.test.mjs \
+            test/runtime-adoption.test.mjs \
+            test/runtime-binding.test.mjs \
             test/skills.test.mjs \
             test/transactional-updater.test.mjs
 
       - name: Transactional updater coverage gate
         run: npm run test:transactional:coverage
+
+      - name: Runtime lifecycle coverage gate
+        run: npm run test:runtime-lifecycle:coverage

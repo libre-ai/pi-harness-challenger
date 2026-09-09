@@ -20,6 +20,41 @@ test("le spike Gondolin reste hors du package Pi principal", () => {
   assert.match(npmIgnore, /^experiments\/$/m);
 });
 
+test("la CI couvre le cycle runtime et le setup Gondolin reste reproductible", () => {
+  const rootPackage = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const experimentPackage = JSON.parse(readFileSync(join(experiment, "package.json"), "utf8"));
+  const experimentLock = JSON.parse(readFileSync(join(experiment, "package-lock.json"), "utf8"));
+  const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+
+  assert.equal(
+    rootPackage.scripts["setup:gondolin"],
+    "npm ci --ignore-scripts --prefix experiments/gondolin",
+  );
+  assert.match(ci, /runtime-adoption runtime-binding/);
+  assert.match(ci, /test\/runtime-adoption\.test\.mjs/);
+  assert.match(ci, /test\/runtime-binding\.test\.mjs/);
+  assert.match(ci, /npm run test:runtime-lifecycle:coverage/);
+
+  const undiciOverride = experimentPackage.overrides?.undici;
+  assert.match(undiciOverride ?? "", /^6\.\d+\.\d+$/);
+  assert.equal(experimentLock.packages["node_modules/undici"].version, undiciOverride);
+  assert.ok(
+    compareVersions(undiciOverride, "6.28.0") >= 0,
+    `undici ${undiciOverride} must include the security fixes from 6.28.0`,
+  );
+});
+
+function compareVersions(left, right) {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] - rightParts[index];
+  }
+
+  return 0;
+}
+
 test("la politique Gondolin est sans montage, sans egress et sans fallback hôte", () => {
   const source = readFileSync(join(experiment, "sandbox.mjs"), "utf8");
   const boundaryProbe = readFileSync(join(experiment, "spike.mjs"), "utf8");
