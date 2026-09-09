@@ -35,6 +35,7 @@ import {
   verifyCandidatePackage,
 } from "../experiments/gondolin/deployment-controller.mjs";
 import {
+  buildRecoveryEnvironment,
   homebrewRecoveryAnchor,
   inspectRuntimeBinding,
   promoteRuntimeBinding,
@@ -207,6 +208,146 @@ function staticDeploymentFixture({
       }
       temporary.cleanup();
     },
+  };
+}
+
+async function runtimeLifecycleFixture() {
+  const temporary = temporaryRoot("pi-runtime-lifecycle-");
+  const root = join(temporary.root, "deployment");
+  const home = join(temporary.root, "home");
+  const controllerRoot = join(root, "controller");
+  const runtimeRoot = join(controllerRoot, "runtime");
+  const runtimeExperimentRoot = join(runtimeRoot, "experiments", "gondolin");
+  const packageRoot = join(root, "releases", "0.1.0-test", "node_modules", "@earendil-works", "pi-coding-agent");
+  const releaseRoot = join(root, "releases", "0.1.0-test");
+  const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
+  const recoveryCanonicalNode = realpathSync(process.execPath);
+  const nodeRecoveryPath = homebrewRecoveryAnchor(recoveryCanonicalNode);
+  const oldKeg = join(temporary.root, "old-keg");
+  const oldNode = join(oldKeg, "bin", "node");
+
+  mkdirSync(controllerRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(runtimeExperimentRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(join(runtimeRoot, "scripts"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(packageRoot, "dist"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".local", "bin"), { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(oldNode), { recursive: true, mode: 0o700 });
+
+  const controllerFiles = [
+    "deployment-controller.mjs",
+    "release-manager.mjs",
+    "runtime-adoption.mjs",
+    "runtime-binding.mjs",
+    "update-local.mjs",
+  ];
+  for (const file of controllerFiles) {
+    cpSync(join(sourceRoot, "experiments", "gondolin", file), join(controllerRoot, file));
+  }
+  writeFileSync(join(runtimeExperimentRoot, "safe-rpc-launcher.mjs"), "process.exit(64);\n", { mode: 0o600 });
+  writeFileSync(join(runtimeExperimentRoot, "deployed-rpc-e2e.mjs"), "process.exit(0);\n", { mode: 0o600 });
+  writeFileSync(join(runtimeExperimentRoot, "budget-test.mjs"), "process.exit(0);\n", { mode: 0o600 });
+  writeFileSync(
+    join(runtimeRoot, "scripts", "sandbox-license-audit.mjs"),
+    "process.stdout.write('{\"allPass\":true}\\n');\n",
+    { mode: 0o600 },
+  );
+  buildCriticalManifest(
+    root,
+    controllerFiles.map((file) => `controller/${file}`),
+    join(root, "controller.sha256"),
+  );
+  buildCriticalManifest(root, [
+    "controller/runtime/experiments/gondolin/budget-test.mjs",
+    "controller/runtime/experiments/gondolin/deployed-rpc-e2e.mjs",
+    "controller/runtime/experiments/gondolin/safe-rpc-launcher.mjs",
+    "controller/runtime/scripts/sandbox-license-audit.mjs",
+  ], join(root, "runtime.sha256"));
+
+  const packageJson = {
+    name: "@earendil-works/pi-coding-agent",
+    version: "0.1.0",
+    license: "MIT",
+    bin: { pi: "dist/cli.js" },
+  };
+  writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(
+    join(packageRoot, "dist", "cli.js"),
+    "if (process.argv.includes('--version')) process.stdout.write('0.1.0\\n');\n",
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(packageRoot, "dist", "rpc-entry.js"),
+    "process.stderr.write('pi-rpc-launcher-required\\n'); process.exit(64);\n",
+    { mode: 0o600 },
+  );
+  writeFileSync(join(packageRoot, "npm-shrinkwrap.json"), `${JSON.stringify({
+    packages: { "": { license: "MIT" } },
+  }, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(join(releaseRoot, "release.json"), `${JSON.stringify({
+    version: 1,
+    packageName: "@earendil-works/pi-coding-agent",
+    packageVersion: "0.1.0",
+    integrity: "sha512-test",
+    source: "test",
+    rpcEntry: {},
+  }, null, 2)}\n`, { mode: 0o600 });
+  buildCriticalManifest(releaseRoot, [
+    "release.json",
+    "node_modules/@earendil-works/pi-coding-agent/package.json",
+    "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+    "node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js",
+    "node_modules/@earendil-works/pi-coding-agent/npm-shrinkwrap.json",
+  ], join(releaseRoot, "critical.sha256"));
+  symlinkSync("releases/0.1.0-test", join(root, "current"));
+
+  writeFileSync(oldNode, `#!/bin/sh\nexec '${recoveryCanonicalNode}' "$@"\n`, { mode: 0o700 });
+  const oldBinding = await promoteRuntimeBinding({
+    deploymentRoot: root,
+    canonicalNodePath: realpathSync(oldNode),
+    nodeVersion: "v26.7.0",
+    qualifiedAt: "2026-09-01T00:00:00.000Z",
+    source: "homebrew",
+    qualificationGate: async () => true,
+  });
+  const nodePath = join(root, "node-current", "node");
+  const launcherPath = join(runtimeExperimentRoot, "safe-rpc-launcher.mjs");
+  const piWrapper = renderStablePiWrapper({ deploymentRoot: root, nodePath, nodeRecoveryPath, launcherPath });
+  const launcherWrapper = renderStableLauncherWrapper({ deploymentRoot: root, nodePath, nodeRecoveryPath, launcherPath });
+  writeFileSync(join(root, "pi"), piWrapper, { mode: 0o700 });
+  writeFileSync(join(root, "pi-gondolin-rpc"), launcherWrapper, { mode: 0o700 });
+  symlinkSync(join(root, "pi"), join(home, ".local", "bin", "pi"));
+  symlinkSync(join(root, "pi-gondolin-rpc"), join(home, ".local", "bin", "pi-gondolin-rpc"));
+  writeFileSync(join(root, "deployment.json"), `${JSON.stringify({
+    version: 3,
+    profile: "gondolin-rpc-transactional-releases",
+    runtimeBindingVersion: 1,
+    nodePath,
+    nodeRecoveryPath,
+    npmCommand: [nodePath, "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"],
+    qemuPath: "/opt/homebrew/bin/qemu-system-aarch64",
+    packageName: "@earendil-works/pi-coding-agent",
+    currentRelease: "0.1.0-test",
+    previousRelease: null,
+    wrappers: {
+      piSha256: sha256Text(piWrapper),
+      launcherSha256: sha256Text(launcherWrapper),
+    },
+  }, null, 2)}\n`, { mode: 0o600 });
+
+  return {
+    root,
+    home,
+    oldKeg,
+    oldBinding,
+    recoveryCanonicalNode,
+    releaseHashesBefore: hashTree(join(root, "releases")),
+    recoveryEnvironment: () => buildRecoveryEnvironment({ deploymentRoot: root, home }),
+    runPi: (args, extraEnvironment = {}) => spawnSync(join(home, ".local", "bin", "pi"), args, {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home, ...extraEnvironment },
+      timeout: 30_000,
+    }),
+    cleanup: temporary.cleanup,
   };
 }
 
@@ -625,6 +766,41 @@ test("runtime repin CLI accepts no executable argument and reports only stable r
     assert.equal(refusedArgument.stderr, "gondolin-transactional-update-refused:usage-invalid\n");
     assert.equal(readlinkSync(join(fixture.root, "node-current")), originalTarget);
   } finally {
+    fixture.cleanup();
+  }
+});
+
+test("recovers after Homebrew removes the exact Node keg without changing Pi", async () => {
+  const fixture = await runtimeLifecycleFixture();
+  const removedKeg = `${fixture.oldKeg}.removed`;
+  try {
+    const before = fixture.runPi(["--version"]);
+    assert.equal(before.status, 0, before.stderr);
+    assert.equal(before.stdout.trim(), "0.1.0");
+
+    renameSync(fixture.oldKeg, removedKeg);
+    const recovered = fixture.runPi(["--version"], {
+      OPENAI_API_KEY: "must-not-cross-recovery",
+      PWD: "/private/project-path",
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(recovered.stdout.trim(), "0.1.0");
+    assert.equal(fixture.recoveryEnvironment().OPENAI_API_KEY, undefined);
+    assert.equal(fixture.recoveryEnvironment().PWD, undefined);
+
+    const active = inspectRuntimeBinding({ deploymentRoot: fixture.root, requireExecutable: true });
+    assert.equal(active.canonicalNodePath, fixture.recoveryCanonicalNode);
+    assert.equal(active.nodeVersion, process.version);
+    assert.equal(hashTree(join(fixture.root, "releases")), fixture.releaseHashesBefore);
+    assert.equal(existsSync(fixture.oldBinding.bindingRoot), true);
+
+    const auditText = readdirSync(join(fixture.root, "node-bindings"))
+      .map((bindingId) => readFileSync(join(fixture.root, "node-bindings", bindingId, "binding.json"), "utf8"))
+      .join("\n");
+    assert.doesNotMatch(auditText, /must-not-cross-recovery|private\/project-path|--version/);
+    assert.doesNotMatch(auditText, new RegExp(fixture.home.replaceAll("/", "\\/")));
+  } finally {
+    if (existsSync(removedKeg)) renameSync(removedKeg, fixture.oldKeg);
     fixture.cleanup();
   }
 });

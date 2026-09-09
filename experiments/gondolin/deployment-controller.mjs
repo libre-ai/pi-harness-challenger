@@ -1249,15 +1249,14 @@ function runtimeConfigurationStatus(paths, state) {
     return { runtimeConfigurationMatched: configured, runtimeExecutable };
   }
 
-  let binding;
   const runtimeConfigurationMatched = checkStaticIntegrity(() => {
-    binding = inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: false });
+    inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: false });
     const stableNodePath = join(paths.deploymentRoot, "node-current", "node");
     return state.runtimeBindingVersion === 1
       && state.nodePath === stableNodePath
       && Array.isArray(state.npmCommand)
       && state.npmCommand[0] === stableNodePath
-      && state.nodeRecoveryPath === homebrewRecoveryAnchor(binding.canonicalNodePath);
+      && ["/opt/homebrew/opt/node/bin/node", "/usr/local/opt/node/bin/node"].includes(state.nodeRecoveryPath);
   });
   const runtimeExecutable = runtimeConfigurationMatched && checkStaticIntegrity(() => {
     inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: true });

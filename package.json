@@ -26,6 +26,7 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:transactional:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/release-manager.mjs --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=95 test/transactional-updater.test.mjs",
+    "test:runtime-lifecycle:coverage": "node --test --experimental-test-coverage --test-coverage-include=experiments/gondolin/runtime-binding.mjs --test-coverage-include=experiments/gondolin/runtime-adoption.mjs --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=100 test/runtime-binding.test.mjs test/runtime-adoption.test.mjs",
     "smoke": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./extensions/policy-gate/index.mjs -e ./extensions/handoff/index.mjs --list-models __challenger_smoke__",
     "smoke:skills": "PI_OFFLINE=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --skill ./skills --list-models __challenger_skills_smoke__",
     "smoke:rpc": "node experiments/gondolin/deployed-rpc-e2e.mjs",
@@ -47,6 +48,6 @@
     "eval:sandbox:licenses": "node scripts/sandbox-license-audit.mjs",
     "eval:status": "node scripts/eval-status.mjs",
     "lint:comments": "node scripts/comment-hygiene.mjs",
-    "check": "npm run lint:comments && npm run test && npm run test:transactional:coverage && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
+    "check": "npm run lint:comments && npm run test && npm run test:transactional:coverage && npm run test:runtime-lifecycle:coverage && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
   }
 }
