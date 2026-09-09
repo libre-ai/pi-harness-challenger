@@ -20,6 +20,9 @@ const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+
 const INTEGRITY_PATTERN = /^sha512-[0-9A-Za-z+/=_-]+$/;
 const RELEASE_ID_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/;
 const MANIFEST_LINE_PATTERN = /^([a-f0-9]{64})  (.+)$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UPDATE_LOCK_OWNER_KEYS = ["acquiredAt", "nonce", "pid", "version"];
+const UPDATE_LOCK_RETRIES = 3;
 
 function isOwned(stats) {
   return typeof process.getuid !== "function" || stats.uid === process.getuid();
@@ -195,33 +198,144 @@ export function releaseIdFor(release) {
   return `${release.version}-${integrityHash}`;
 }
 
+function lockMode(stats) {
+  return stats.mode & 0o777;
+}
+
+function readUpdateLockOwner(lockPath) {
+  const ownerPath = join(lockPath, "owner.json");
+  let ownerStats;
+  let owner;
+  try {
+    ownerStats = lstatSync(ownerPath);
+    if (!ownerStats.isFile()
+      || ownerStats.isSymbolicLink()
+      || !isOwned(ownerStats)
+      || lockMode(ownerStats) !== 0o600
+      || ownerStats.size > 4096) {
+      throw new Error("update-lock-owner-invalid");
+    }
+    owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+  } catch (error) {
+    if (error?.message === "update-lock-owner-invalid") throw error;
+    throw new Error("update-lock-owner-invalid");
+  }
+
+  const keys = owner && typeof owner === "object" && !Array.isArray(owner)
+    ? Object.keys(owner).sort()
+    : [];
+  const acquiredAt = typeof owner?.acquiredAt === "string" ? new Date(owner.acquiredAt) : null;
+  if (keys.length !== UPDATE_LOCK_OWNER_KEYS.length
+    || keys.some((key, index) => key !== UPDATE_LOCK_OWNER_KEYS[index])
+    || owner.version !== 1
+    || !Number.isSafeInteger(owner.pid)
+    || owner.pid <= 0
+    || typeof owner.nonce !== "string"
+    || !UUID_PATTERN.test(owner.nonce)
+    || acquiredAt === null
+    || Number.isNaN(acquiredAt.valueOf())
+    || acquiredAt.toISOString() !== owner.acquiredAt) {
+    throw new Error("update-lock-owner-invalid");
+  }
+  return owner;
+}
+
+function inspectUpdateLock(lockPath) {
+  let stats;
+  try {
+    stats = lstatSync(lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isDirectory()
+    || stats.isSymbolicLink()
+    || !isOwned(stats)
+    || lockMode(stats) !== 0o700) {
+    throw new Error("update-lock-unsafe");
+  }
+  return { owner: readUpdateLockOwner(lockPath), stats };
+}
+
+export function lockOwnerAlive(pid, killProcess = process.kill) {
+  try {
+    killProcess(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw new Error("update-lock-owner-invalid");
+  }
+}
+
+function sameLock(lockPath, expected) {
+  const inspected = inspectUpdateLock(lockPath);
+  return inspected !== null
+    && inspected.stats.dev === expected.stats.dev
+    && inspected.stats.ino === expected.stats.ino
+    && inspected.owner.nonce === expected.owner.nonce;
+}
+
+function quarantineVerifiedLock(lockPath, expected, label) {
+  const quarantinePath = join(dirname(lockPath), `.${label}-${randomUUID()}`);
+  renameSync(lockPath, quarantinePath);
+  let matches = false;
+  try {
+    matches = sameLock(quarantinePath, expected);
+  } catch {
+    matches = false;
+  }
+  if (!matches) {
+    // The rename closes the check/delete race; a mismatch is restored when no
+    // competing owner has already claimed the canonical lock path.
+    if (!lstatExists(lockPath)) renameSync(quarantinePath, lockPath);
+    throw new Error("update-lock-replaced");
+  }
+  return quarantinePath;
+}
+
 export function acquireUpdateLock(deploymentRoot) {
   ensureOwnedDirectory(deploymentRoot);
   const lockPath = join(deploymentRoot, "update.lock");
-  try {
-    mkdirSync(lockPath, { mode: 0o700 });
-  } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-    const stats = lstatSync(lockPath);
-    if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("update-lock-unsafe");
-    throw new Error("update-lock-active");
-  }
-  const stats = lstatSync(lockPath);
-  if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
-    rmSync(lockPath, { recursive: true, force: true });
-    throw new Error("update-lock-unsafe");
-  }
-  atomicWrite(join(lockPath, "owner.json"), `${JSON.stringify({ pid: process.pid })}\n`);
-  let released = false;
-  return () => {
-    if (released) return;
-    const currentStats = lstatSync(lockPath);
-    if (currentStats.dev !== stats.dev || currentStats.ino !== stats.ino || !isOwned(currentStats)) {
-      throw new Error("update-lock-replaced");
+  for (let attempt = 0; attempt < UPDATE_LOCK_RETRIES; attempt += 1) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      chmodSync(lockPath, 0o700);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const existing = inspectUpdateLock(lockPath);
+      if (existing === null) continue;
+      if (lockOwnerAlive(existing.owner.pid)) throw new Error("update-lock-active");
+      let quarantinePath;
+      try {
+        quarantinePath = quarantineVerifiedLock(lockPath, existing, "update-lock-dead");
+      } catch (reclaimError) {
+        if (reclaimError?.code === "ENOENT") continue;
+        throw reclaimError;
+      }
+      rmSync(quarantinePath, { recursive: true });
+      continue;
     }
-    rmSync(lockPath, { recursive: true });
-    released = true;
-  };
+
+    const owner = {
+      version: 1,
+      pid: process.pid,
+      nonce: randomUUID(),
+      acquiredAt: new Date().toISOString(),
+    };
+    atomicWrite(join(lockPath, "owner.json"), `${JSON.stringify(owner)}\n`);
+    const acquired = inspectUpdateLock(lockPath);
+    if (acquired === null || acquired.owner.nonce !== owner.nonce) throw new Error("update-lock-replaced");
+    let released = false;
+    return () => {
+      if (released) return;
+      if (!sameLock(lockPath, acquired)) throw new Error("update-lock-replaced");
+      const quarantinePath = quarantineVerifiedLock(lockPath, acquired, "update-lock-release");
+      rmSync(quarantinePath, { recursive: true });
+      released = true;
+    };
+  }
+  throw new Error("update-lock-retry-exhausted");
 }
 
 export function buildCriticalManifest(releaseRoot, relativePaths, manifestPath) {

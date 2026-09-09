@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -45,6 +45,7 @@ import {
   buildCriticalManifest,
   classifyUpdateRequest,
   compareVersions,
+  lockOwnerAlive,
   parseLatestRelease,
   promoteCandidate,
   releaseIdFor,
@@ -999,19 +1000,149 @@ test("l’audit des dépendances Pi refuse les licences interdites ou inconnues"
   }
 });
 
-test("le verrou update est privé, exclusif et refuse les symlinks", () => {
+test("le verrou update est privé, exclusif, exact et idempotent", () => {
   const { root, cleanup } = temporaryRoot("pi-updater-lock-");
   try {
     const release = acquireUpdateLock(root);
+    const lockPath = join(root, "update.lock");
+    const ownerPath = join(lockPath, "owner.json");
+    const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+    assert.deepEqual(Object.keys(owner), ["version", "pid", "nonce", "acquiredAt"]);
+    assert.equal(owner.version, 1);
+    assert.equal(owner.pid, process.pid);
+    assert.match(owner.nonce, /^[0-9a-f-]{36}$/);
+    assert.equal(new Date(owner.acquiredAt).toISOString(), owner.acquiredAt);
+    assert.equal(lstatSync(lockPath).mode & 0o777, 0o700);
+    assert.equal(lstatSync(ownerPath).mode & 0o777, 0o600);
     assert.throws(() => acquireUpdateLock(root), /update-lock-active/);
+    release();
     release();
     const secondRelease = acquireUpdateLock(root);
     secondRelease();
+  } finally {
+    cleanup();
+  }
+});
 
-    const target = join(root, "lock-target");
-    mkdirSync(target, { mode: 0o700 });
-    symlinkSync(target, join(root, "update.lock"));
-    assert.throws(() => acquireUpdateLock(root), /update-lock-unsafe/);
+test("un verrou ambigu ou remplacé n’est jamais supprimé", async (t) => {
+  await t.test("symlink", () => {
+    const { root, cleanup } = temporaryRoot("pi-updater-lock-symlink-");
+    try {
+      const target = join(root, "lock-target");
+      mkdirSync(target, { mode: 0o700 });
+      symlinkSync(target, join(root, "update.lock"));
+      assert.throws(() => acquireUpdateLock(root), /update-lock-unsafe/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  for (const [name, content, mode] of [
+    ["malformed metadata", "{}\n", 0o600],
+    ["public metadata", `${JSON.stringify(validLockOwner(999_999_999))}\n`, 0o644],
+    ["extra metadata", `${JSON.stringify({ ...validLockOwner(999_999_999), command: "secret" })}\n`, 0o600],
+  ]) {
+    await t.test(name, () => {
+      const { root, cleanup } = temporaryRoot("pi-updater-lock-invalid-");
+      try {
+        const lockPath = join(root, "update.lock");
+        mkdirSync(lockPath, { mode: 0o700 });
+        writeFileSync(join(lockPath, "owner.json"), content, { mode });
+        assert.throws(() => acquireUpdateLock(root), /update-lock-owner-invalid/);
+        assert.equal(existsSync(lockPath), true);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+
+  await t.test("PID reused by a live process", () => {
+    const { root, cleanup } = temporaryRoot("pi-updater-lock-reused-pid-");
+    try {
+      const lockPath = join(root, "update.lock");
+      mkdirSync(lockPath, { mode: 0o700 });
+      writeFileSync(
+        join(lockPath, "owner.json"),
+        `${JSON.stringify(validLockOwner(process.pid))}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => acquireUpdateLock(root), /update-lock-active/);
+      assert.equal(existsSync(lockPath), true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  await t.test("replaced inode", () => {
+    const { root, cleanup } = temporaryRoot("pi-updater-lock-replaced-");
+    try {
+      const release = acquireUpdateLock(root);
+      const lockPath = join(root, "update.lock");
+      renameSync(lockPath, join(root, "original.lock"));
+      mkdirSync(lockPath, { mode: 0o700 });
+      writeFileSync(
+        join(lockPath, "owner.json"),
+        `${JSON.stringify(validLockOwner(process.pid))}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(release, /update-lock-replaced/);
+      assert.equal(existsSync(lockPath), true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  await t.test("replaced nonce", () => {
+    const { root, cleanup } = temporaryRoot("pi-updater-lock-replaced-nonce-");
+    try {
+      const release = acquireUpdateLock(root);
+      const ownerPath = join(root, "update.lock", "owner.json");
+      const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+      writeFileSync(ownerPath, `${JSON.stringify({ ...owner, nonce: randomUUID() })}\n`, { mode: 0o600 });
+      assert.throws(release, /update-lock-replaced/);
+      assert.equal(existsSync(join(root, "update.lock")), true);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test("la sonde de propriétaire traite EPERM comme vivant et les erreurs inconnues en refus", () => {
+  const permissionDenied = Object.assign(new Error("denied"), { code: "EPERM" });
+  const unknownFailure = Object.assign(new Error("unknown"), { code: "EIO" });
+  assert.equal(lockOwnerAlive(123, () => { throw permissionDenied; }), true);
+  assert.throws(() => lockOwnerAlive(123, () => { throw unknownFailure; }), /update-lock-owner-invalid/);
+});
+
+function validLockOwner(pid) {
+  return {
+    version: 1,
+    pid,
+    nonce: "11111111-1111-4111-8111-111111111111",
+    acquiredAt: "2026-09-09T00:00:00.000Z",
+  };
+}
+
+test("un verrou abandonné par un processus mort est récupéré", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-dead-lock-");
+  const releaseManagerUrl = new URL("../experiments/gondolin/release-manager.mjs", import.meta.url).href;
+  const childSource = `
+    import { acquireUpdateLock } from ${JSON.stringify(releaseManagerUrl)};
+    acquireUpdateLock(process.argv[1]);
+    process.stdout.write("locked\\n");
+  `;
+
+  try {
+    const child = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", childSource, root],
+      { encoding: "utf8" },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout, "locked\n");
+
+    const release = acquireUpdateLock(root);
+    release();
   } finally {
     cleanup();
   }
