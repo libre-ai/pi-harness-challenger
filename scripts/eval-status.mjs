@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -89,7 +90,17 @@ const gondolinTechnicalCases = [
 ];
 const gondolinTechnicalReady = allPassed(gondolinTechnicalCases);
 const licenseApproved = casesById.get("sandbox-license-policy")?.evaluationStatus === "challenger-pass";
-const deploymentCheck = spawnSync(process.execPath, [join(root, "experiments", "gondolin", "deploy-local.mjs"), "status"], {
+const transactionalStatePath = join(
+  homedir(),
+  ".local",
+  "share",
+  "pi-harness-challenger",
+  "gondolin-rpc",
+  "v3",
+  "deployment.json",
+);
+const deploymentStatusScript = existsSync(transactionalStatePath) ? "update-local.mjs" : "deploy-local.mjs";
+const deploymentCheck = spawnSync(process.execPath, [join(root, "experiments", "gondolin", deploymentStatusScript), "status"], {
   cwd: root,
   encoding: "utf8",
   timeout: 30_000,

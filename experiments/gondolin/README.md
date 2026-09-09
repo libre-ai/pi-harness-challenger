@@ -24,6 +24,86 @@ npm install --ignore-scripts --omit=optional --no-audit --no-fund
 
 Versions du spike : QEMU 11.0.2 et `@earendil-works/gondolin` 0.12.0.
 
+Migration du profil v2 vers le contrôleur transactionnel :
+
+```bash
+npm run transactional:install
+npm run transactional:status
+pi update
+npm run transactional:automation:enable
+```
+
+## Binding Node qualifié et récupération Homebrew
+
+Le déploiement v3 exécute Pi via `node-current/node`. Ce lien sélectionne une génération
+de binding privée et immuable vers un keg Node exact. Une mise à niveau Homebrew peut
+supprimer cet ancien keg ; au lancement suivant, le wrapper vérifie d'abord les
+manifestes puis utilise uniquement l'ancre fixe Homebrew pour qualifier le runtime
+courant et remplacer `node-current` atomiquement.
+
+Commandes opérateur :
+
+```sh
+npm run transactional:install
+npm run transactional:status
+PI_GONDOLIN_DEPLOYMENT_ROOT="$HOME/.local/share/pi-harness-challenger/gondolin-rpc/v3" \
+  /opt/homebrew/opt/node/bin/node experiments/gondolin/update-local.mjs runtime-repin
+```
+
+`transactional:install` adopte aussi un v3 historique qui stocke directement un chemin
+`Cellar`, même si ce chemin a déjà disparu. Cette adoption est journalisée et reprend
+après interruption sans remplacer les releases ni leurs liens `current`/`previous`.
+
+La récupération automatique et `runtime-repin` sont volontairement étroits :
+
+- ils agissent seulement si le binding actif exact n'est plus exécutable ;
+- un binding encore sain produit `node-runtime-still-healthy` ;
+- une dérive de manifeste ou d'état produit `deployment-pre-repin-invalid` ;
+- une ancre différente produit `node-runtime-recovery-mismatch` ;
+- un gate incompatible produit `node-runtime-qualification-refused` ;
+- un Node hors Homebrew Apple Silicon ou Intel est refusé ;
+- aucune recherche de runtime via `PATH`, aucun chemin passé en argument et aucun
+  fallback réseau ne sont permis ;
+- aucune release Pi n'est téléchargée, qualifiée ou promue par `runtime-repin`.
+
+Les wrappers ramènent tout échec de récupération à leur refus d'intégrité stable et
+n'écrivent ni stdout ni stderr du contrôleur dans un log. La qualification reçoit un
+environnement allowlisté sans clés fournisseur, prompt, commande ou chemin de projet.
+Homebrew constitue ici l'autorité de provenance de l'interpréteur ; les gates prouvent
+la compatibilité du runtime avec la release courante, pas l'innocuité d'un binaire
+Homebrew malveillant.
+
+Exemple synthétique des champs runtime de `deployment.json` :
+
+```json
+{
+  "version": 3,
+  "runtimeBindingVersion": 1,
+  "nodePath": "/opt/homebrew/var/pi-gondolin/v3/node-current/node",
+  "nodeRecoveryPath": "/opt/homebrew/opt/node/bin/node",
+  "npmCommand": [
+    "/opt/homebrew/var/pi-gondolin/v3/node-current/node",
+    "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"
+  ]
+}
+```
+
+Exemple synthétique de `node-bindings/<id>/binding.json` :
+
+```json
+{
+  "runtimeBindingVersion": 1,
+  "bindingId": "node-26.8.1-0123456789ab",
+  "canonicalNodePath": "/opt/homebrew/Cellar/node/26.8.1/bin/node",
+  "nodeVersion": "v26.8.1",
+  "qualifiedAt": "2026-09-09T12:00:00.000Z",
+  "recoverySource": "homebrew-recovery"
+}
+```
+
+Ces métadonnées conservent la preuve de qualification précédente sans PII. Le chemin
+canonique est un chemin système Homebrew synthétique, jamais un répertoire utilisateur.
+
 ## Exécution
 
 ```bash
@@ -40,12 +120,17 @@ npm run test:budgets
 # Launcher RPC serveur : refus host + import confirmé, sans provider
 npm run spike:rpc-launcher
 
-# Vérification du profil RPC installé
+# Vérification du profil RPC transactionnel installé
 npm run deployment:status
 npm run deployment:e2e
 
-# Rollback atomique du profil installé
+# Mise à jour Pi qualifiée, puis rollback de release
+pi update
 npm run deployment:rollback
+
+# Poll automatique au chargement puis toutes les heures
+npm run transactional:automation:enable
+npm run transactional:automation:disable
 
 # Vérifie le contrat source de la proposition amont sans l’appliquer
 npm run check:upstream-proposal
@@ -75,4 +160,4 @@ Le spike handoff n’expose aucun outil de mutation au modèle. Il valide strict
 
 L’extension de laboratoire doit être la première extension enregistrant `bash` — Pi conserve le premier outil homonyme — avec une liste d’outils explicite. La commande `bash` native du protocole RPC contourne le hook `user_bash`. Le client des runners les refuse avant stdin et `safe-rpc-launcher.mjs` applique la même garde côté serveur avec une composition Pi fixe. Les probes passent uniquement par les outils modèle sandboxés ou des commandes d’extension fermées. L’attestation policy est retirée au timeout, à l’abort et au shutdown. L’import snapshot exige une liste explicite et une confirmation. L’export reste une prévisualisation ; seule la commande d’application séparée peut écrire sur la fixture hôte après une seconde confirmation et contrôle des hashes.
 
-L’exception `tweetnacl@0.14.5`/Unlicense est approuvée uniquement pour Gondolin 0.12.0 aux empreintes de `license-exception.json`. Le profil RPC installé vérifie un manifeste avant chaque lancement, refuse `pi --mode rpc` direct ainsi que `rpc-entry`, conserve un rollback atomique et exige ce rollback avant toute commande `pi update`.
+L’exception `tweetnacl@0.14.5`/Unlicense est approuvée uniquement pour Gondolin 0.12.0 aux empreintes de `license-exception.json`. Le profil RPC installé vérifie les manifestes du contrôleur, du runtime copié et de la release active avant chaque lancement. Il refuse `pi --mode rpc` direct ainsi que `rpc-entry`. `pi update` passe par une candidate isolée et ne modifie `current` qu’après intégrité npm, audit de licences, budgets et E2E Gondolin verts. `previous` permet un rollback atomique ; une incompatibilité reste fail-closed et ne déclenche pas de requalification QEMU répétée tant que la release ou le contrôleur ne change pas.

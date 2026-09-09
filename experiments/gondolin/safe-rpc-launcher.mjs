@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -16,6 +16,7 @@ import { validateSnapshotPath } from "./snapshot.mjs";
 const directory = dirname(fileURLToPath(import.meta.url));
 let runtimeDirectory;
 let child;
+let piExecutable = "pi";
 let inputBuffer = Buffer.alloc(0);
 let fatalExitCode;
 let killTimer;
@@ -28,6 +29,15 @@ function refuseStartup() {
 
 function validateEnvironment() {
   if (process.argv.length !== 2) throw new Error("launcher-arguments-refused");
+  const configuredPiExecutable = process.env.PI_GONDOLIN_PI_EXECUTABLE;
+  if (configuredPiExecutable !== undefined) {
+    if (!isAbsolute(configuredPiExecutable)
+      || configuredPiExecutable.includes("\0")
+      || configuredPiExecutable.includes("\n")) {
+      throw new Error("launcher-pi-executable-invalid");
+    }
+    piExecutable = configuredPiExecutable;
+  }
   const root = process.env.PI_GONDOLIN_SNAPSHOT_ROOT;
   const encodedFiles = process.env.PI_GONDOLIN_SNAPSHOT_FILES;
   if (typeof root !== "string" || !root || root.includes("\0") || root.includes("\n") || typeof encodedFiles !== "string") {
@@ -104,8 +114,9 @@ if (process.exitCode === undefined) {
   delete childEnvironment.NODE_OPTIONS;
   delete childEnvironment.NODE_PATH;
   delete childEnvironment.PI_GONDOLIN_SESSION_BUDGET_MS;
+  delete childEnvironment.PI_GONDOLIN_PI_EXECUTABLE;
 
-  child = spawn("pi", [
+  child = spawn(piExecutable, [
     "--mode", "rpc",
     "--no-session",
     "--no-extensions",

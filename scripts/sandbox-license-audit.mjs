@@ -4,15 +4,20 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
-const piCommand = spawnSync("sh", ["-lc", "command -v pi"], { encoding: "utf8", timeout: 10_000 });
-if (piCommand.status !== 0) throw new Error("Unable to resolve pi executable");
-let piExecutable = realpathSync(piCommand.stdout.trim());
-let piRoot = resolve(dirname(piExecutable), "..");
-if (!existsSync(join(piRoot, "package.json"))) {
-  const deploymentStatePath = join(homedir(), ".local", "share", "pi-harness-challenger", "gondolin-rpc", "deployment.json");
-  if (!existsSync(deploymentStatePath)) throw new Error("Unable to resolve Pi package root");
-  piExecutable = JSON.parse(readFileSync(deploymentStatePath, "utf8")).originalPi?.realPath;
+let piRoot;
+if (process.env.PI_CANDIDATE_PACKAGE_ROOT) {
+  piRoot = realpathSync(process.env.PI_CANDIDATE_PACKAGE_ROOT);
+} else {
+  const piCommand = spawnSync("sh", ["-lc", "command -v pi"], { encoding: "utf8", timeout: 10_000 });
+  if (piCommand.status !== 0) throw new Error("Unable to resolve pi executable");
+  let piExecutable = realpathSync(piCommand.stdout.trim());
   piRoot = resolve(dirname(piExecutable), "..");
+  if (!existsSync(join(piRoot, "package.json"))) {
+    const deploymentStatePath = join(homedir(), ".local", "share", "pi-harness-challenger", "gondolin-rpc", "deployment.json");
+    if (!existsSync(deploymentStatePath)) throw new Error("Unable to resolve Pi package root");
+    piExecutable = JSON.parse(readFileSync(deploymentStatePath, "utf8")).originalPi?.realPath;
+    piRoot = resolve(dirname(piExecutable), "..");
+  }
 }
 if (!existsSync(join(piRoot, "package.json"))) throw new Error("Unable to resolve Pi package root");
 const candidates = {

@@ -19,7 +19,7 @@ const root = mkdtempSync(join(tmpdir(), "gondolin-session-budget-"));
 const snapshotRoot = join(root, "snapshot");
 mkdirSync(snapshotRoot, { recursive: true, mode: 0o700 });
 writeFileSync(join(snapshotRoot, "README.md"), "budget fixture\n", { mode: 0o600 });
-const launcher = join(homedir(), ".local", "bin", "pi-gondolin-rpc");
+const launcher = process.env.PI_GONDOLIN_LAUNCHER ?? join(homedir(), ".local", "bin", "pi-gondolin-rpc");
 
 try {
   const result = await new Promise((resolve, reject) => {

@@ -12,8 +12,8 @@ name: CI
 #   test/eval-status.test.mjs       — assertions sur l'état des rapports
 #                                     d'évaluation de la machine de l'owner
 #
-# 56 des 59 cas tournent ici en ~125 ms. Les 3 autres restent owner-run, comme
-# les smokes de `npm run check` qui demandent une VM Gondolin et un déploiement
+# 67 des 70 cas tournent ici. Les 3 autres restent owner-run, comme les smokes
+# de `npm run check` qui demandent une VM Gondolin et un déploiement
 # local attesté. Les inclure produirait un rouge permanent — c'est-à-dire un
 # gate qu'on apprend à ignorer.
 on:
@@ -34,7 +34,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22.19.0'
 
       # Sans ce contrôle, un fichier de test ajouté plus tard ne serait jamais
       # exécuté ici et personne ne le remarquerait : la CI resterait verte en
@@ -42,7 +42,7 @@ jobs:
       - name: The runnable list still covers every test file
         run: |
           set -euo pipefail
-          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills"
+          expected="comment-hygiene config evals extensions-integration gondolin-experiment handoff policy-gate-hardening policy-gate policy-sandbox-friction skills transactional-updater"
           excluded="eval-status sandbox-preflight"
           missing=0
           for f in test/*.test.mjs; do
@@ -73,4 +73,8 @@ jobs:
             test/policy-gate-hardening.test.mjs \
             test/policy-gate.test.mjs \
             test/policy-sandbox-friction.test.mjs \
-            test/skills.test.mjs
+            test/skills.test.mjs \
+            test/transactional-updater.test.mjs
+
+      - name: Transactional updater coverage gate
+        run: npm run test:transactional:coverage
