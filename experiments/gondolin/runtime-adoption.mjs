@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
-  existsSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -26,6 +25,7 @@ const NEXT_PHASE = new Map([
   ["launchd-loaded", "complete"],
 ]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const ADOPTION_PREPARATION_PATTERN = /^\.adoption-prepare-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isOwned(stats) {
   return typeof process.getuid !== "function" || stats.uid === process.getuid();
@@ -83,6 +83,25 @@ function adoptionPaths(deploymentRoot) {
   };
 }
 
+function pathExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function fsyncDirectory(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function durableWriteJournal(adoptionRoot, journalPath, journal) {
   const temporaryPath = join(adoptionRoot, `.journal-${process.pid}-${randomUUID()}.tmp`);
   const descriptor = openSync(temporaryPath, "wx", 0o600);
@@ -93,17 +112,11 @@ function durableWriteJournal(adoptionRoot, journalPath, journal) {
     closeSync(descriptor);
   }
   renameSync(temporaryPath, journalPath);
-  const directoryDescriptor = openSync(adoptionRoot, "r");
-  try {
-    fsyncSync(directoryDescriptor);
-  } finally {
-    closeSync(directoryDescriptor);
-  }
+  fsyncDirectory(adoptionRoot);
 }
 
-function readJournal(deploymentRoot) {
-  const { adoptionRoot, journalPath } = adoptionPaths(deploymentRoot);
-  requirePrivateDirectory(deploymentRoot, "adoption-deployment-directory-unsafe");
+function readJournalAt(adoptionRoot) {
+  const journalPath = join(adoptionRoot, "journal.json");
   requirePrivateDirectory(adoptionRoot, "adoption-journal-directory-unsafe");
   requirePrivateFile(journalPath);
   let journal;
@@ -113,6 +126,12 @@ function readJournal(deploymentRoot) {
     throw new Error("adoption-journal-json-invalid");
   }
   return validateJournal(journal);
+}
+
+function readJournal(deploymentRoot) {
+  const { adoptionRoot } = adoptionPaths(deploymentRoot);
+  requirePrivateDirectory(deploymentRoot, "adoption-deployment-directory-unsafe");
+  return readJournalAt(adoptionRoot);
 }
 
 function removeAdoptionRoot(deploymentRoot) {
@@ -128,21 +147,47 @@ function removeAdoptionRoot(deploymentRoot) {
   }
   makeWritable(adoptionRoot);
   rmSync(adoptionRoot, { recursive: true });
+  fsyncDirectory(deploymentRoot);
+}
+
+export function removeAbandonedAdoptionPreparations({ deploymentRoot }) {
+  requirePrivateDirectory(deploymentRoot, "adoption-deployment-directory-unsafe");
+  let removed = 0;
+  for (const entry of readdirSync(deploymentRoot)) {
+    if (!entry.startsWith(".adoption-prepare-")) continue;
+    if (!ADOPTION_PREPARATION_PATTERN.test(entry)) throw new Error("adoption-preparation-name-invalid");
+    const preparationRoot = join(deploymentRoot, entry);
+    requirePrivateDirectory(preparationRoot, "adoption-preparation-directory-unsafe");
+    if (readdirSync(preparationRoot).sort().join("\0") !== "journal.json") {
+      throw new Error("adoption-preparation-content-invalid");
+    }
+    const journal = readJournalAt(preparationRoot);
+    if (journal.phase !== "prepared") throw new Error("adoption-preparation-phase-invalid");
+    rmSync(preparationRoot, { recursive: true });
+    removed += 1;
+  }
+  if (removed > 0) fsyncDirectory(deploymentRoot);
+  return removed;
 }
 
 export function beginRuntimeAdoption({ deploymentRoot, artifacts }) {
   requirePrivateDirectory(deploymentRoot, "adoption-deployment-directory-unsafe");
   validateArtifacts(artifacts);
-  const { adoptionRoot, journalPath } = adoptionPaths(deploymentRoot);
-  if (existsSync(adoptionRoot)) throw new Error("adoption-journal-already-exists");
-  mkdirSync(adoptionRoot, { mode: 0o700 });
-  requirePrivateDirectory(adoptionRoot, "adoption-journal-directory-unsafe");
+  const { adoptionRoot } = adoptionPaths(deploymentRoot);
+  if (pathExists(adoptionRoot)) throw new Error("adoption-journal-already-exists");
+  removeAbandonedAdoptionPreparations({ deploymentRoot });
+  const preparationRoot = join(deploymentRoot, `.adoption-prepare-${randomUUID()}`);
+  mkdirSync(preparationRoot, { mode: 0o700 });
+  chmodSync(preparationRoot, 0o700);
+  requirePrivateDirectory(preparationRoot, "adoption-preparation-directory-unsafe");
   const journal = {
     version: ADOPTION_JOURNAL_VERSION,
     phase: "prepared",
     artifacts,
   };
-  durableWriteJournal(adoptionRoot, journalPath, journal);
+  durableWriteJournal(preparationRoot, join(preparationRoot, "journal.json"), journal);
+  renameSync(preparationRoot, adoptionRoot);
+  fsyncDirectory(deploymentRoot);
   return journal;
 }
 
@@ -167,7 +212,8 @@ export async function recoverRuntimeAdoption({
   finishActivation,
 }) {
   const { adoptionRoot, journalPath } = adoptionPaths(deploymentRoot);
-  if (!existsSync(adoptionRoot)) return "none";
+  removeAbandonedAdoptionPreparations({ deploymentRoot });
+  if (!pathExists(adoptionRoot)) return "none";
   requireRecoveryCallback(verifyInstalled);
   requireRecoveryCallback(restoreBackups);
   requireRecoveryCallback(finishActivation);

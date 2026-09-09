@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -20,6 +21,7 @@ import {
   advanceRuntimeAdoption,
   beginRuntimeAdoption,
   recoverRuntimeAdoption,
+  removeAbandonedAdoptionPreparations,
 } from "../experiments/gondolin/runtime-adoption.mjs";
 
 function makeWritable(path) {
@@ -80,6 +82,77 @@ test("adoption journal persists an exact private non-PII schema", () => {
     );
   } finally {
     cleanup();
+  }
+});
+
+test("a crash immediately before publication never exposes an empty adoption journal", () => {
+  const { root, cleanup } = fixture();
+  const moduleUrl = new URL("../experiments/gondolin/runtime-adoption.mjs", import.meta.url).href;
+  const childSource = `
+    import fs from "node:fs";
+    import { basename } from "node:path";
+    import { syncBuiltinESMExports } from "node:module";
+    const originalRename = fs.renameSync;
+    fs.renameSync = (source, destination) => {
+      if (basename(destination) === "adoption") process.exit(0);
+      return originalRename(source, destination);
+    };
+    syncBuiltinESMExports();
+    const { beginRuntimeAdoption } = await import(${JSON.stringify(moduleUrl)});
+    beginRuntimeAdoption({
+      deploymentRoot: process.argv[1],
+      artifacts: ${JSON.stringify(adoptionArtifacts())},
+    });
+  `;
+
+  try {
+    const child = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", childSource, root],
+      { encoding: "utf8" },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(existsSync(join(root, "adoption")), false);
+    const preparations = readdirSync(root).filter((name) => name.startsWith(".adoption-prepare-"));
+    assert.equal(preparations.length, 1);
+    const preparationRoot = join(root, preparations[0]);
+    assert.equal(lstatSync(preparationRoot).mode & 0o077, 0);
+    assert.equal(lstatSync(join(preparationRoot, "journal.json")).mode & 0o077, 0);
+    assert.equal(removeAbandonedAdoptionPreparations({ deploymentRoot: root }), 1);
+    assert.equal(readdirSync(root).some((name) => name.startsWith(".adoption-prepare-")), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("abandoned adoption cleanup refuses every unverified preparation", async (t) => {
+  const cases = [
+    ["invalid name", (root) => {
+      mkdirSync(join(root, ".adoption-prepare-not-a-uuid"), { mode: 0o700 });
+    }, /adoption-preparation-name-invalid/],
+    ["symlink", (root) => {
+      const target = join(root, "preparation-target");
+      mkdirSync(target, { mode: 0o700 });
+      symlinkSync(target, join(root, ".adoption-prepare-11111111-1111-4111-8111-111111111111"));
+    }, /adoption-preparation-directory-unsafe/],
+    ["unexpected content", (root) => {
+      const preparation = join(root, ".adoption-prepare-11111111-1111-4111-8111-111111111111");
+      mkdirSync(preparation, { mode: 0o700 });
+      writeFileSync(join(preparation, "unexpected"), "value\n", { mode: 0o600 });
+    }, /adoption-preparation-content-invalid/],
+  ];
+
+  for (const [name, prepare, expected] of cases) {
+    await t.test(name, () => {
+      const { root, cleanup } = fixture();
+      try {
+        prepare(root);
+        assert.throws(() => removeAbandonedAdoptionPreparations({ deploymentRoot: root }), expected);
+        assert.equal(readdirSync(root).some((entry) => entry.startsWith(".adoption-prepare-")), true);
+      } finally {
+        cleanup();
+      }
+    });
   }
 });
 
