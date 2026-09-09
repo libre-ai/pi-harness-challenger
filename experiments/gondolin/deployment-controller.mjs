@@ -574,6 +574,17 @@ function resolveNpmCommand() {
   return [realpathSync(process.execPath), npmPath];
 }
 
+export function buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath, npmPath }) {
+  const nodePath = join(deploymentRoot, "node-current", "node");
+  return {
+    version: DEPLOYMENT_VERSION,
+    runtimeBindingVersion: 1,
+    nodePath,
+    nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
+    npmCommand: [nodePath, npmPath],
+  };
+}
+
 function qualificationEnvironment(overrides = {}, baseEnvironment = process.env) {
   return {
     ...baseEnvironment,
@@ -697,7 +708,27 @@ function postActivationSmoke(paths, expectedVersion) {
     && incomplete.stderr === "gondolin-rpc-launcher-refused\n";
 }
 
-export function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
+function removeDeploymentTree(path) {
+  if (!existsSync(path)) return;
+  const bindingsRoot = join(path, "node-bindings");
+  if (existsSync(bindingsRoot)) {
+    const stats = lstatSync(bindingsRoot);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
+      throw new Error("node-runtime-bindings-directory-unsafe");
+    }
+    for (const entry of readdirSync(bindingsRoot)) {
+      const bindingRoot = join(bindingsRoot, entry);
+      const bindingStats = lstatSync(bindingRoot);
+      if (!bindingStats.isDirectory() || bindingStats.isSymbolicLink() || !isOwned(bindingStats)) {
+        throw new Error("node-runtime-binding-directory-unsafe");
+      }
+      chmodSync(bindingRoot, 0o700);
+    }
+  }
+  rmSync(path, { recursive: true, force: true });
+}
+
+export async function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
   const paths = deploymentPaths(home, overrideRoot);
   if (existsSync(paths.statePath)) return deploymentStatusV3({ home, deploymentRoot: overrideRoot });
   if (existsSync(paths.deploymentRoot)) throw new Error("deployment-v3-path-exists");
@@ -710,13 +741,38 @@ export function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
   try {
     copyRuntime(projectRoot, stagingRoot);
     const migrated = prepareMigratedRelease(paths, stagingRoot, legacyState);
-    const nodePath = realpathSync(process.execPath);
-    writeDeploymentWrappers(stagingRoot, paths.deploymentRoot, nodePath);
+    const canonicalNodePath = realpathSync(process.execPath);
+    const [, npmPath] = resolveNpmCommand();
+    const runtimeState = buildDeploymentRuntimeState({
+      deploymentRoot: paths.deploymentRoot,
+      canonicalNodePath,
+      npmPath,
+    });
+    ensureOwnedDirectory(join(stagingRoot, "tmp"));
+    const installEnvironment = buildRecoveryEnvironment({ deploymentRoot: stagingRoot, home });
+    writeDeploymentWrappers(
+      stagingRoot,
+      paths.deploymentRoot,
+      runtimeState.nodePath,
+      runtimeState.nodeRecoveryPath,
+    );
+    await promoteRuntimeBinding({
+      deploymentRoot: stagingRoot,
+      canonicalNodePath,
+      nodeVersion: readNodeVersion(canonicalNodePath, installEnvironment),
+      qualifiedAt: new Date().toISOString(),
+      source: "install",
+      qualificationGate: async (candidateNodePath) => qualifyRelease({
+        deploymentRoot: stagingRoot,
+        releaseRoot: migrated.releaseRoot,
+        nodePath: candidateNodePath,
+        launcherPath: join(stagingRoot, "controller", "runtime", "experiments", "gondolin", "safe-rpc-launcher.mjs"),
+        environment: installEnvironment,
+      }),
+    });
     const state = {
-      version: DEPLOYMENT_VERSION,
+      ...runtimeState,
       profile: "gondolin-rpc-transactional-releases",
-      nodePath,
-      npmCommand: resolveNpmCommand(),
       qemuPath: resolveExecutable("qemu-system-aarch64"),
       packageName: PI_PACKAGE_NAME,
       currentRelease: migrated.releaseId,
@@ -728,20 +784,12 @@ export function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
       },
     };
     writeOwnedJson(join(stagingRoot, "deployment.json"), state);
-    if (!qualifyRelease({
-      deploymentRoot: stagingRoot,
-      releaseRoot: migrated.releaseRoot,
-      nodePath,
-      launcherPath: join(stagingRoot, "controller", "runtime", "experiments", "gondolin", "safe-rpc-launcher.mjs"),
-    })) {
-      throw new Error("migration-candidate-qualification-refused");
-    }
     renameSync(stagingRoot, paths.deploymentRoot);
     linksSwitched = true;
     atomicSymlink(paths.piWrapper, paths.installedPi);
     atomicSymlink(paths.launcherWrapper, paths.installedLauncher);
     if (!postActivationSmoke(paths, migrated.release.version)) throw new Error("migration-post-activation-refused");
-    const e2e = run(nodePath, [join(paths.deploymentRoot, "controller", "runtime", "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
+    const e2e = run(state.nodePath, [join(paths.deploymentRoot, "controller", "runtime", "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
       env: qualificationEnvironment({ PI_GONDOLIN_DEPLOYMENT_ROOT: paths.deploymentRoot }),
       timeout: 240_000,
     });
@@ -752,8 +800,8 @@ export function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
       atomicSymlink(oldPiTarget, paths.installedPi);
       atomicSymlink(oldLauncherTarget, paths.installedLauncher);
     }
-    rmSync(stagingRoot, { recursive: true, force: true });
-    rmSync(paths.deploymentRoot, { recursive: true, force: true });
+    removeDeploymentTree(stagingRoot);
+    removeDeploymentTree(paths.deploymentRoot);
     throw error;
   }
 }

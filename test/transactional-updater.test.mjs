@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   auditPiPackageLicenses,
+  buildDeploymentRuntimeState,
   deploymentStaticStatusV3,
   renderLaunchAgentPlist,
   renderStableLauncherWrapper,
@@ -33,6 +34,7 @@ import {
 import {
   homebrewRecoveryAnchor,
   inspectRuntimeBinding,
+  promoteRuntimeBinding,
 } from "../experiments/gondolin/runtime-binding.mjs";
 import {
   acquireUpdateLock,
@@ -172,6 +174,50 @@ test("static deployment validation accepts a missing qualified runtime without e
     assert.equal(fixture.executionCount(), 0);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("fresh v3 runtime binding uses one stable deployment-owned Node path", async () => {
+  const temporary = temporaryRoot("pi-fresh-v3-binding-");
+  const deploymentRoot = join(temporary.root, "deployment");
+  mkdirSync(deploymentRoot, { mode: 0o700 });
+  let binding;
+  try {
+    const canonicalNodePath = realpathSync(process.execPath);
+    binding = await promoteRuntimeBinding({
+      deploymentRoot,
+      canonicalNodePath,
+      nodeVersion: process.version,
+      qualifiedAt: "2026-09-09T00:00:00.000Z",
+      source: "install",
+      qualificationGate: async () => true,
+    });
+    const npmPath = "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js";
+    const state = buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath, npmPath });
+    const expectedNodePath = join(deploymentRoot, "node-current", "node");
+
+    assert.deepEqual(state, {
+      version: 3,
+      runtimeBindingVersion: 1,
+      nodePath: expectedNodePath,
+      nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
+      npmCommand: [expectedNodePath, npmPath],
+    });
+    assert.equal(
+      inspectRuntimeBinding({ deploymentRoot, requireExecutable: true }).canonicalNodePath,
+      canonicalNodePath,
+    );
+    const wrapper = renderStablePiWrapper({
+      deploymentRoot,
+      nodePath: state.nodePath,
+      nodeRecoveryPath: state.nodeRecoveryPath,
+      launcherPath: join(deploymentRoot, "controller", "runtime", "safe-rpc-launcher.mjs"),
+    });
+    assert.match(wrapper, new RegExp(expectedNodePath.replaceAll("/", "\\/")));
+    assert.match(wrapper, new RegExp(state.nodeRecoveryPath.replaceAll("/", "\\/")));
+  } finally {
+    if (binding) chmodSync(binding.bindingRoot, 0o700);
+    temporary.cleanup();
   }
 });
 
