@@ -12,6 +12,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -22,9 +23,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  adoptRuntimeBindingV3,
   auditPiPackageLicenses,
   buildDeploymentRuntimeState,
   deploymentStaticStatusV3,
+  installV3,
   renderLaunchAgentPlist,
   renderStableLauncherWrapper,
   renderStablePiWrapper,
@@ -50,7 +53,23 @@ import {
 
 function temporaryRoot(prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
-  return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return {
+    root,
+    cleanup: () => {
+      makeTreeWritable(root);
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function makeTreeWritable(path) {
+  if (!existsSync(path)) return;
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink()) return;
+  if (stats.isDirectory()) {
+    chmodSync(path, 0o700);
+    for (const entry of readdirSync(path)) makeTreeWritable(join(path, entry));
+  }
 }
 
 function resolvedLink(path) {
@@ -61,15 +80,31 @@ function sha256Text(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function hashTree(root, current = root) {
+  const hash = createHash("sha256");
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+    const path = join(current, entry.name);
+    const relativePath = path.slice(root.length + 1);
+    hash.update(relativePath);
+    if (entry.isSymbolicLink()) hash.update(`link:${readlinkSync(path)}`);
+    else if (entry.isDirectory()) hash.update(hashTree(root, path));
+    else hash.update(readFileSync(path));
+  }
+  return hash.digest("hex");
+}
+
 function staticDeploymentFixture({
   canonicalNodePath = "/opt/homebrew/Cellar/node/0.0.0-missing/bin/node",
   nodeVersion = "v0.0.0",
+  runtimeBinding = true,
 } = {}) {
   const temporary = temporaryRoot("pi-static-deployment-");
   const root = join(temporary.root, "deployment");
   const home = join(temporary.root, "home");
   const releaseId = "0.84.2-test";
   const releaseRoot = join(root, "releases", releaseId);
+  const previousReleaseId = "0.84.1-test";
+  const previousReleaseRoot = join(root, "releases", previousReleaseId);
   const controllerPath = join(root, "controller", "deployment-controller.mjs");
   const runtimePath = join(root, "controller", "runtime", "runtime-entry.mjs");
   const piWrapper = join(root, "pi");
@@ -81,7 +116,7 @@ function staticDeploymentFixture({
   mkdirSync(dirname(controllerPath), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(runtimePath), { recursive: true, mode: 0o700 });
   mkdirSync(releaseRoot, { recursive: true, mode: 0o700 });
-  mkdirSync(bindingRoot, { recursive: true, mode: 0o700 });
+  if (runtimeBinding) mkdirSync(bindingRoot, { recursive: true, mode: 0o700 });
   mkdirSync(join(home, ".local", "bin"), { recursive: true, mode: 0o700 });
   writeFileSync(controllerPath, "controller\n", { mode: 0o600 });
   writeFileSync(runtimePath, "runtime\n", { mode: 0o600 });
@@ -97,7 +132,11 @@ function staticDeploymentFixture({
   }, null, 2)}\n`;
   writeFileSync(join(releaseRoot, "release.json"), releaseMetadata, { mode: 0o600 });
   buildCriticalManifest(releaseRoot, ["release.json"], join(releaseRoot, "critical.sha256"));
+  mkdirSync(previousReleaseRoot, { recursive: true, mode: 0o700 });
+  writeFileSync(join(previousReleaseRoot, "release.json"), releaseMetadata, { mode: 0o600 });
+  buildCriticalManifest(previousReleaseRoot, ["release.json"], join(previousReleaseRoot, "critical.sha256"));
   symlinkSync(`releases/${releaseId}`, join(root, "current"));
+  symlinkSync(`releases/${previousReleaseId}`, join(root, "previous"));
 
   const instrumentedWrapper = `#!/bin/sh\nprintf invoked > ${markerPath}\nexit 64\n`;
   writeFileSync(piWrapper, instrumentedWrapper, { mode: 0o700 });
@@ -113,33 +152,37 @@ function staticDeploymentFixture({
     qualifiedAt: "2026-09-09T00:00:00.000Z",
     recoverySource: "homebrew",
   }, null, 2)}\n`;
-  writeFileSync(join(bindingRoot, "binding.json"), bindingMetadata, { mode: 0o400 });
-  symlinkSync(canonicalNodePath, join(bindingRoot, "node"));
-  writeFileSync(
-    join(bindingRoot, "binding.sha256"),
-    `${sha256Text(bindingMetadata)}  binding.json\n${sha256Text(canonicalNodePath)}  node.target\n`,
-    { mode: 0o400 },
-  );
-  chmodSync(bindingRoot, 0o500);
-  symlinkSync(`node-bindings/${bindingId}`, join(root, "node-current"));
+  if (runtimeBinding) {
+    writeFileSync(join(bindingRoot, "binding.json"), bindingMetadata, { mode: 0o400 });
+    symlinkSync(canonicalNodePath, join(bindingRoot, "node"));
+    writeFileSync(
+      join(bindingRoot, "binding.sha256"),
+      `${sha256Text(bindingMetadata)}  binding.json\n${sha256Text(canonicalNodePath)}  node.target\n`,
+      { mode: 0o400 },
+    );
+    chmodSync(bindingRoot, 0o500);
+    symlinkSync(`node-bindings/${bindingId}`, join(root, "node-current"));
+  }
 
-  const nodePath = join(root, "node-current", "node");
+  const nodePath = runtimeBinding ? join(root, "node-current", "node") : canonicalNodePath;
   const state = {
     version: 3,
     profile: "gondolin-rpc-transactional-releases",
-    runtimeBindingVersion: 1,
     nodePath,
-    nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
     npmCommand: [nodePath, "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"],
     qemuPath: "/opt/homebrew/bin/qemu-system-aarch64",
     packageName: "@earendil-works/pi-coding-agent",
     currentRelease: releaseId,
-    previousRelease: null,
+    previousRelease: previousReleaseId,
     wrappers: {
       piSha256: sha256Text(instrumentedWrapper),
       launcherSha256: sha256Text(instrumentedWrapper),
     },
   };
+  if (runtimeBinding) {
+    state.runtimeBindingVersion = 1;
+    state.nodeRecoveryPath = homebrewRecoveryAnchor(canonicalNodePath);
+  }
   writeFileSync(join(root, "deployment.json"), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 
   return {
@@ -157,8 +200,10 @@ function staticDeploymentFixture({
     },
     executionCount: () => existsSync(markerPath) ? 1 : 0,
     cleanup: () => {
-      for (const entry of readdirSync(join(root, "node-bindings"))) {
-        chmodSync(join(root, "node-bindings", entry), 0o700);
+      if (existsSync(join(root, "node-bindings"))) {
+        for (const entry of readdirSync(join(root, "node-bindings"))) {
+          chmodSync(join(root, "node-bindings", entry), 0o700);
+        }
       }
       temporary.cleanup();
     },
@@ -172,6 +217,159 @@ test("static deployment validation accepts a missing qualified runtime without e
     assert.equal(status.staticIntegrityPassed, true);
     assert.equal(status.runtimeExecutable, false);
     assert.equal(fixture.executionCount(), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("adopts healthy and broken direct-path v3 deployments without changing releases", async (t) => {
+  const cases = [
+    ["healthy", realpathSync(process.execPath), process.version],
+    ["broken", "/opt/homebrew/Cellar/node/0.0.0-missing/bin/node", "v0.0.0"],
+  ];
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  for (const [name, canonicalNodePath, nodeVersion] of cases) {
+    await t.test(name, async () => {
+      const fixture = staticDeploymentFixture({ canonicalNodePath, nodeVersion, runtimeBinding: false });
+      const before = {
+        current: readlinkSync(join(fixture.root, "current")),
+        previous: readlinkSync(join(fixture.root, "previous")),
+        releases: hashTree(join(fixture.root, "releases")),
+      };
+      try {
+        const events = [];
+        let activationCount = 0;
+        const result = await adoptRuntimeBindingV3({
+          home: fixture.home,
+          projectRoot,
+          deploymentRoot: fixture.root,
+          qualificationGate: async (context) => {
+            events.push(context);
+            return true;
+          },
+          postActivationGate: async () => {
+            activationCount += 1;
+            return true;
+          },
+        });
+        const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+        assert.equal(events.length, 1);
+        assert.equal(activationCount, 1);
+        assert.equal(events[0].environment.OPENAI_API_KEY, undefined);
+        assert.equal(state.runtimeBindingVersion, 1);
+        assert.equal(state.nodePath, join(fixture.root, "node-current", "node"));
+        assert.equal(result.staticIntegrityPassed, true);
+        assert.equal(readlinkSync(join(fixture.root, "current")), before.current);
+        assert.equal(readlinkSync(join(fixture.root, "previous")), before.previous);
+        assert.equal(hashTree(join(fixture.root, "releases")), before.releases);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("adoption interruption recovery completes every durable phase without changing releases", async (t) => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  for (const phase of ["prepared", "artifacts-installed", "binding-active", "launchd-loaded"]) {
+    await t.test(phase, async () => {
+      const fixture = staticDeploymentFixture({ runtimeBinding: false });
+      const releaseHashesBefore = hashTree(join(fixture.root, "releases"));
+      const currentBefore = readlinkSync(join(fixture.root, "current"));
+      const previousBefore = readlinkSync(join(fixture.root, "previous"));
+      try {
+        await assert.rejects(adoptRuntimeBindingV3({
+          home: fixture.home,
+          projectRoot,
+          deploymentRoot: fixture.root,
+          interruptionPoint: phase,
+          qualificationGate: async () => true,
+          postActivationGate: async () => true,
+        }), /adoption-test-interruption/);
+
+        const status = await installV3({
+          home: fixture.home,
+          projectRoot,
+          deploymentRoot: fixture.root,
+          qualificationGate: async () => true,
+          postActivationGate: async () => true,
+        });
+        assert.equal(status.staticIntegrityPassed, true);
+        assert.equal(readlinkSync(join(fixture.root, "current")), currentBefore);
+        assert.equal(readlinkSync(join(fixture.root, "previous")), previousBefore);
+        assert.equal(hashTree(join(fixture.root, "releases")), releaseHashesBefore);
+        assert.equal(existsSync(join(fixture.root, "adoption")), false);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("adoption interruption recovery starts from the journal when deployment state is between renames", async () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const fixture = staticDeploymentFixture({ runtimeBinding: false });
+  const releaseHashesBefore = hashTree(join(fixture.root, "releases"));
+  try {
+    await assert.rejects(adoptRuntimeBindingV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      interruptionPoint: "prepared",
+      qualificationGate: async () => true,
+      postActivationGate: async () => true,
+    }), /adoption-test-interruption/);
+    const backupRoot = join(fixture.root, "adoption", "backups");
+    mkdirSync(backupRoot, { mode: 0o700 });
+    const stateBackup = join(backupRoot, "deployment.json");
+    const state = readFileSync(fixture.paths.statePath);
+    writeFileSync(stateBackup, state, { mode: 0o600 });
+    rmSync(fixture.paths.statePath);
+
+    const status = await installV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      qualificationGate: async () => true,
+      postActivationGate: async () => true,
+    });
+    assert.equal(status.staticIntegrityPassed, true);
+    assert.equal(hashTree(join(fixture.root, "releases")), releaseHashesBefore);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("adoption interruption recovery finishes a binding moved before node-current", async () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const fixture = staticDeploymentFixture({ runtimeBinding: false });
+  try {
+    await assert.rejects(adoptRuntimeBindingV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      interruptionPoint: "artifacts-installed",
+      qualificationGate: async () => true,
+      postActivationGate: async () => true,
+    }), /adoption-test-interruption/);
+    const stagedBindingRoot = join(fixture.root, "adoption", "staged", "node-binding");
+    const metadata = JSON.parse(readFileSync(join(stagedBindingRoot, "binding.json"), "utf8"));
+    const bindingsRoot = join(fixture.root, "node-bindings");
+    mkdirSync(bindingsRoot, { mode: 0o700 });
+    chmodSync(stagedBindingRoot, 0o700);
+    const finalBindingRoot = join(bindingsRoot, metadata.bindingId);
+    renameSync(stagedBindingRoot, finalBindingRoot);
+    chmodSync(finalBindingRoot, 0o500);
+
+    const status = await installV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      qualificationGate: async () => true,
+      postActivationGate: async () => true,
+    });
+    assert.equal(status.staticIntegrityPassed, true);
+    assert.equal(inspectRuntimeBinding({ deploymentRoot: fixture.root, requireExecutable: true }).active, true);
   } finally {
     fixture.cleanup();
   }

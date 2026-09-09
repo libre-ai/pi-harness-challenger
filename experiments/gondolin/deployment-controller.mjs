@@ -35,6 +35,11 @@ import {
   inspectRuntimeBinding,
   promoteRuntimeBinding,
 } from "./runtime-binding.mjs";
+import {
+  advanceRuntimeAdoption,
+  beginRuntimeAdoption,
+  recoverRuntimeAdoption,
+} from "./runtime-adoption.mjs";
 
 const DEPLOYMENT_VERSION = 3;
 const LAUNCH_AGENT_LABEL = "dev.pi-gondolin.transactional-update";
@@ -475,6 +480,7 @@ function copyRuntime(projectRoot, stagingRoot) {
   ensureOwnedDirectory(controllerRoot);
   ensureOwnedDirectory(runtimeRoot);
   cpSync(join(projectRoot, "experiments", "gondolin", "release-manager.mjs"), join(controllerRoot, "release-manager.mjs"));
+  cpSync(join(projectRoot, "experiments", "gondolin", "runtime-adoption.mjs"), join(controllerRoot, "runtime-adoption.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "runtime-binding.mjs"), join(controllerRoot, "runtime-binding.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "deployment-controller.mjs"), join(controllerRoot, "deployment-controller.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "update-local.mjs"), join(controllerRoot, "update-local.mjs"));
@@ -496,6 +502,7 @@ function copyRuntime(projectRoot, stagingRoot) {
   const controllerFiles = [
     "controller/deployment-controller.mjs",
     "controller/release-manager.mjs",
+    "controller/runtime-adoption.mjs",
     "controller/runtime-binding.mjs",
     "controller/update-local.mjs",
   ];
@@ -710,27 +717,434 @@ function postActivationSmoke(paths, expectedVersion) {
 
 function removeDeploymentTree(path) {
   if (!existsSync(path)) return;
-  const bindingsRoot = join(path, "node-bindings");
-  if (existsSync(bindingsRoot)) {
-    const stats = lstatSync(bindingsRoot);
-    if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
-      throw new Error("node-runtime-bindings-directory-unsafe");
-    }
-    for (const entry of readdirSync(bindingsRoot)) {
-      const bindingRoot = join(bindingsRoot, entry);
-      const bindingStats = lstatSync(bindingRoot);
-      if (!bindingStats.isDirectory() || bindingStats.isSymbolicLink() || !isOwned(bindingStats)) {
-        throw new Error("node-runtime-binding-directory-unsafe");
+  function makeOwnedDirectoriesWritable(current) {
+    const stats = lstatSync(current);
+    if (!isOwned(stats)) throw new Error("deployment-cleanup-path-unsafe");
+    if (stats.isSymbolicLink()) return;
+    if (stats.isDirectory()) {
+      chmodSync(current, 0o700);
+      for (const entry of readdirSync(current)) {
+        makeOwnedDirectoriesWritable(join(current, entry));
       }
-      chmodSync(bindingRoot, 0o700);
     }
   }
+  makeOwnedDirectoriesWritable(path);
   rmSync(path, { recursive: true, force: true });
 }
 
-export async function installV3({ home, projectRoot, deploymentRoot: overrideRoot }) {
+function treeDigest(root, current = root) {
+  const hash = createHash("sha256");
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+    const path = join(current, entry.name);
+    hash.update(relative(root, path).split(sep).join("/"));
+    const stats = lstatSync(path);
+    if (stats.isSymbolicLink()) hash.update(`link:${readlinkSync(path)}`);
+    else if (stats.isDirectory()) hash.update(treeDigest(root, path));
+    else if (stats.isFile()) hash.update(readFileSync(path));
+    else throw new Error("adoption-artifact-unsafe");
+  }
+  return hash.digest("hex");
+}
+
+function controllerArtifactDigest(deploymentRoot) {
+  return createHash("sha256")
+    .update(treeDigest(join(deploymentRoot, "controller")))
+    .update(readFileSync(join(deploymentRoot, "controller.sha256")))
+    .digest("hex");
+}
+
+function launchdDigest(path) {
+  return existsSync(path) ? sha256(path) : "";
+}
+
+function adoptionArtifactDigests(paths) {
+  return {
+    controller: controllerArtifactDigest(paths.deploymentRoot),
+    pi: sha256(paths.piWrapper),
+    "pi-gondolin-rpc": sha256(paths.launcherWrapper),
+    "deployment.json": sha256(paths.statePath),
+    launchd: launchdDigest(paths.launchAgentPath),
+  };
+}
+
+function adoptionArtifacts(oldDigests, newDigests) {
+  return Object.fromEntries(Object.keys(oldDigests).map((key) => [key, {
+    oldSha256: oldDigests[key],
+    newSha256: newDigests[key],
+  }]));
+}
+
+function adoptionControllerFiles() {
+  return [
+    "controller/deployment-controller.mjs",
+    "controller/release-manager.mjs",
+    "controller/runtime-adoption.mjs",
+    "controller/runtime-binding.mjs",
+    "controller/update-local.mjs",
+  ];
+}
+
+function stageAdoptionController({ projectRoot, deploymentRoot, stagingRoot }) {
+  cpSync(join(deploymentRoot, "controller"), join(stagingRoot, "controller"), { recursive: true });
+  for (const file of [
+    "deployment-controller.mjs",
+    "release-manager.mjs",
+    "runtime-adoption.mjs",
+    "runtime-binding.mjs",
+    "update-local.mjs",
+  ]) {
+    cpSync(join(projectRoot, "experiments", "gondolin", file), join(stagingRoot, "controller", file));
+  }
+  buildCriticalManifest(stagingRoot, adoptionControllerFiles(), join(stagingRoot, "controller.sha256"));
+}
+
+function maybeInterrupt(interruptionPoint, phase) {
+  if (interruptionPoint === phase) throw new Error("adoption-test-interruption");
+}
+
+function replaceAdoptionArtifact(livePath, stagedPath, backupPath) {
+  if (existsSync(livePath)) renameSync(livePath, backupPath);
+  renameSync(stagedPath, livePath);
+}
+
+function stagedBindingId(stagedBindingRoot) {
+  const metadata = readOwnedJson(join(stagedBindingRoot, "binding.json"));
+  if (typeof metadata.bindingId !== "string" || !/^node-[0-9A-Za-z.+-]+-[a-f0-9]{12}$/.test(metadata.bindingId)) {
+    throw new Error("adoption-binding-metadata-invalid");
+  }
+  return metadata.bindingId;
+}
+
+function activateAdoptionBinding(paths) {
+  const stagedBindingRoot = join(paths.deploymentRoot, "adoption", "staged", "node-binding");
+  const bindingsRoot = join(paths.deploymentRoot, "node-bindings");
+  ensureOwnedDirectory(bindingsRoot);
+  let bindingId;
+  if (existsSync(stagedBindingRoot)) {
+    bindingId = stagedBindingId(stagedBindingRoot);
+  } else {
+    const bindings = readdirSync(bindingsRoot).filter((entry) => /^node-[0-9A-Za-z.+-]+-[a-f0-9]{12}$/.test(entry));
+    if (bindings.length !== 1) throw new Error("adoption-binding-state-unsafe");
+    [bindingId] = bindings;
+  }
+  const finalBindingRoot = join(bindingsRoot, bindingId);
+  if (!existsSync(finalBindingRoot)) {
+    chmodSync(stagedBindingRoot, 0o700);
+    renameSync(stagedBindingRoot, finalBindingRoot);
+    chmodSync(finalBindingRoot, 0o500);
+  }
+  atomicSymlink(`node-bindings/${bindingId}`, join(paths.deploymentRoot, "node-current"));
+  inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: true });
+}
+
+function restoreAdoptionBackups(paths, journal) {
+  const backupRoot = join(paths.deploymentRoot, "adoption", "backups");
+  if (existsSync(join(backupRoot, "deployment.json"))) {
+    rmSync(join(paths.deploymentRoot, "node-current"), { force: true });
+    removeDeploymentTree(join(paths.deploymentRoot, "node-bindings"));
+  }
+  const replacements = [
+    ["controller", join(paths.deploymentRoot, "controller")],
+    ["controller.sha256", join(paths.deploymentRoot, "controller.sha256")],
+    ["pi", paths.piWrapper],
+    ["pi-gondolin-rpc", paths.launcherWrapper],
+    ["deployment.json", paths.statePath],
+  ];
+  for (const [name, livePath] of replacements) {
+    const backupPath = join(backupRoot, name);
+    if (!existsSync(backupPath)) continue;
+    if (existsSync(livePath)) rmSync(livePath, { recursive: true });
+    renameSync(backupPath, livePath);
+  }
+  const launchdBackup = join(backupRoot, "launchd");
+  if (existsSync(launchdBackup)) {
+    run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    if (existsSync(paths.launchAgentPath)) rmSync(paths.launchAgentPath);
+    renameSync(launchdBackup, paths.launchAgentPath);
+    const loaded = run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath], { timeout: 10_000 });
+    if (!resultPassed(loaded)) throw new Error("adoption-launch-agent-restore-refused");
+  } else if (journal.artifacts.launchd.oldSha256 === ""
+    && existsSync(paths.launchAgentPath)
+    && launchdDigest(paths.launchAgentPath) === journal.artifacts.launchd.newSha256) {
+    rmSync(paths.launchAgentPath);
+  }
+}
+
+function verifyAdoptionArtifacts(paths, journal) {
+  try {
+    const actual = adoptionArtifactDigests(paths);
+    const installedKeys = journal.phase === "launchd-loaded"
+      ? Object.keys(journal.artifacts)
+      : Object.keys(journal.artifacts).filter((key) => key !== "launchd");
+    if (!installedKeys.every((key) => actual[key] === journal.artifacts[key].newSha256)) return false;
+    if (journal.phase !== "launchd-loaded" || journal.artifacts.launchd.newSha256 === "") return true;
+    const loaded = run("/bin/launchctl", ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+    return resultPassed(loaded);
+  } catch {
+    return false;
+  }
+}
+
+function installAdoptionArtifacts(paths) {
+  const adoptionRoot = join(paths.deploymentRoot, "adoption");
+  const stagedRoot = join(adoptionRoot, "staged");
+  const backupRoot = join(adoptionRoot, "backups");
+  ensureOwnedDirectory(backupRoot);
+  replaceAdoptionArtifact(
+    join(paths.deploymentRoot, "controller"),
+    join(stagedRoot, "controller"),
+    join(backupRoot, "controller"),
+  );
+  replaceAdoptionArtifact(
+    join(paths.deploymentRoot, "controller.sha256"),
+    join(stagedRoot, "controller.sha256"),
+    join(backupRoot, "controller.sha256"),
+  );
+  replaceAdoptionArtifact(paths.piWrapper, join(stagedRoot, "pi"), join(backupRoot, "pi"));
+  replaceAdoptionArtifact(
+    paths.launcherWrapper,
+    join(stagedRoot, "pi-gondolin-rpc"),
+    join(backupRoot, "pi-gondolin-rpc"),
+  );
+  replaceAdoptionArtifact(paths.statePath, join(stagedRoot, "deployment.json"), join(backupRoot, "deployment.json"));
+}
+
+async function finishAdoptionActivation(paths, journal, postActivationGate, runtimeAlreadyVerified = false) {
+  let phase = journal.phase;
+  if (phase === "artifacts-installed") {
+    activateAdoptionBinding(paths);
+    if (!await postActivationGate()) throw new Error("adoption-post-activation-refused");
+    runtimeAlreadyVerified = true;
+    advanceRuntimeAdoption({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "artifacts-installed",
+      nextPhase: "binding-active",
+    });
+    phase = "binding-active";
+  }
+  if (phase === "binding-active") {
+    if (!runtimeAlreadyVerified && !await postActivationGate()) {
+      throw new Error("adoption-post-activation-refused");
+    }
+    const stagedLaunchd = join(paths.deploymentRoot, "adoption", "staged", "launchd");
+    const launchdBackup = join(paths.deploymentRoot, "adoption", "backups", "launchd");
+    const state = readOwnedJson(paths.statePath);
+    if (state.automation) {
+      ensureOwnedDirectoryPreservingMode(dirname(paths.launchAgentPath));
+      if (existsSync(stagedLaunchd)) {
+        if (existsSync(paths.launchAgentPath) && !existsSync(launchdBackup)) {
+          renameSync(paths.launchAgentPath, launchdBackup);
+        }
+        renameSync(stagedLaunchd, paths.launchAgentPath);
+      }
+      if (!existsSync(paths.launchAgentPath)
+        || sha256(paths.launchAgentPath) !== state.automation.plistSha256) {
+        throw new Error("adoption-launch-agent-integrity-refused");
+      }
+      run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`], { timeout: 10_000 });
+      const loaded = run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath], { timeout: 10_000 });
+      if (!resultPassed(loaded)) throw new Error("adoption-launch-agent-load-refused");
+    }
+    advanceRuntimeAdoption({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "binding-active",
+      nextPhase: "launchd-loaded",
+    });
+  }
+}
+
+async function recoverAdoption(paths, postActivationGate) {
+  return recoverRuntimeAdoption({
+    deploymentRoot: paths.deploymentRoot,
+    verifyInstalled: async (journal) => verifyAdoptionArtifacts(paths, journal),
+    restoreBackups: async (journal) => restoreAdoptionBackups(paths, journal),
+    finishActivation: async (journal) => finishAdoptionActivation(paths, journal, postActivationGate),
+  });
+}
+
+function removeOrphanedAdoptionCandidates(deploymentRoot) {
+  for (const entry of readdirSync(deploymentRoot)) {
+    if (!entry.startsWith(".adoption-candidate-")) continue;
+    const path = join(deploymentRoot, entry);
+    const stats = lstatSync(path);
+    if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
+      throw new Error("adoption-candidate-path-unsafe");
+    }
+    removeDeploymentTree(path);
+  }
+}
+
+export async function adoptRuntimeBindingV3({
+  home,
+  projectRoot,
+  deploymentRoot: overrideRoot,
+  interruptionPoint,
+  qualificationGate,
+  postActivationGate,
+}) {
+  if (interruptionPoint !== undefined
+    && !["prepared", "artifacts-installed", "binding-active", "launchd-loaded"].includes(interruptionPoint)) {
+    throw new Error("adoption-test-interruption-point-invalid");
+  }
+  if (qualificationGate !== undefined && typeof qualificationGate !== "function") {
+    throw new Error("node-runtime-qualification-gate-invalid");
+  }
+  if (postActivationGate !== undefined && typeof postActivationGate !== "function") {
+    throw new Error("adoption-post-activation-gate-invalid");
+  }
   const paths = deploymentPaths(home, overrideRoot);
-  if (existsSync(paths.statePath)) return deploymentStatusV3({ home, deploymentRoot: overrideRoot });
+  const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  const workRoot = join(paths.deploymentRoot, `.adoption-candidate-${process.pid}-${randomUUID()}`);
+  let journalStarted = false;
+  try {
+    const activationGate = postActivationGate ?? (() => {
+      const { release } = stateAndCurrent(paths);
+      return postActivationSmoke(paths, release.packageVersion);
+    });
+    const recovered = await recoverAdoption(paths, activationGate);
+    if (recovered === "completed") {
+      return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+    }
+    removeOrphanedAdoptionCandidates(paths.deploymentRoot);
+    const { state, releaseRoot } = stateAndCurrent(paths);
+    if (state.runtimeBindingVersion === 1) {
+      return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+    }
+    const staticStatus = deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+    if (!staticStatus.staticIntegrityPassed) throw new Error("deployment-pre-adoption-invalid");
+    if (existsSync(join(paths.deploymentRoot, "node-current"))
+      || existsSync(join(paths.deploymentRoot, "node-bindings"))) {
+      throw new Error("adoption-binding-state-unsafe");
+    }
+    const oldAnchor = homebrewRecoveryAnchor(state.nodePath);
+    const candidateNodePath = staticStatus.runtimeExecutable ? realpathSync(state.nodePath) : realpathSync(process.execPath);
+    if (homebrewRecoveryAnchor(candidateNodePath) !== oldAnchor) throw new Error("node-runtime-recovery-mismatch");
+    if (!staticStatus.runtimeExecutable && realpathSync(oldAnchor) !== candidateNodePath) {
+      throw new Error("node-runtime-recovery-mismatch");
+    }
+    ensureOwnedDirectory(workRoot);
+    const stagedRoot = join(workRoot, "staged");
+    ensureOwnedDirectory(stagedRoot);
+    stageAdoptionController({ projectRoot, deploymentRoot: paths.deploymentRoot, stagingRoot: stagedRoot });
+    const [, npmPath] = resolveNpmCommand();
+    const runtimeState = buildDeploymentRuntimeState({
+      deploymentRoot: paths.deploymentRoot,
+      canonicalNodePath: candidateNodePath,
+      npmPath,
+    });
+    writeDeploymentWrappers(stagedRoot, paths.deploymentRoot, runtimeState.nodePath, runtimeState.nodeRecoveryPath);
+    const nextState = {
+      ...state,
+      ...runtimeState,
+      wrappers: {
+        piSha256: sha256(join(stagedRoot, "pi")),
+        launcherSha256: sha256(join(stagedRoot, "pi-gondolin-rpc")),
+      },
+    };
+    if (state.automation) {
+      const plist = renderLaunchAgentPlist({
+        home,
+        deploymentRoot: paths.deploymentRoot,
+        piWrapperPath: paths.piWrapper,
+        qemuPath: state.qemuPath,
+      });
+      atomicWrite(join(stagedRoot, "launchd"), plist);
+      nextState.automation = { ...state.automation, plistSha256: sha256(join(stagedRoot, "launchd")) };
+    }
+    writeOwnedJson(join(stagedRoot, "deployment.json"), nextState);
+    const bindingDeploymentRoot = join(workRoot, "binding");
+    ensureOwnedDirectory(bindingDeploymentRoot);
+    ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
+    const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
+    const gate = qualificationGate ?? ((context) => qualifyRelease({
+      deploymentRoot: paths.deploymentRoot,
+      releaseRoot: context.releaseRoot,
+      nodePath: context.candidateNodePath,
+      launcherPath: paths.launcherPath,
+      environment: context.environment,
+    }));
+    const binding = await promoteRuntimeBinding({
+      deploymentRoot: bindingDeploymentRoot,
+      canonicalNodePath: candidateNodePath,
+      nodeVersion: readNodeVersion(candidateNodePath, environment),
+      qualifiedAt: new Date().toISOString(),
+      source: "v3-adoption",
+      qualificationGate: async () => gate({ candidateNodePath, releaseRoot, environment }),
+    });
+    const stagedBindingRoot = join(stagedRoot, "node-binding");
+    chmodSync(binding.bindingRoot, 0o700);
+    renameSync(binding.bindingRoot, stagedBindingRoot);
+    chmodSync(stagedBindingRoot, 0o500);
+    const oldDigests = adoptionArtifactDigests(paths);
+    const stagedPaths = { ...paths, deploymentRoot: stagedRoot, statePath: join(stagedRoot, "deployment.json"), piWrapper: join(stagedRoot, "pi"), launcherWrapper: join(stagedRoot, "pi-gondolin-rpc"), launchAgentPath: join(stagedRoot, "launchd") };
+    const newDigests = adoptionArtifactDigests(stagedPaths);
+    beginRuntimeAdoption({
+      deploymentRoot: paths.deploymentRoot,
+      artifacts: adoptionArtifacts(oldDigests, newDigests),
+    });
+    journalStarted = true;
+    renameSync(stagedRoot, join(paths.deploymentRoot, "adoption", "staged"));
+    removeDeploymentTree(bindingDeploymentRoot);
+    removeDeploymentTree(workRoot);
+    maybeInterrupt(interruptionPoint, "prepared");
+    installAdoptionArtifacts(paths);
+    advanceRuntimeAdoption({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "prepared",
+      nextPhase: "artifacts-installed",
+    });
+    maybeInterrupt(interruptionPoint, "artifacts-installed");
+    activateAdoptionBinding(paths);
+    if (!await activationGate()) throw new Error("adoption-post-activation-refused");
+    advanceRuntimeAdoption({
+      deploymentRoot: paths.deploymentRoot,
+      expectedPhase: "artifacts-installed",
+      nextPhase: "binding-active",
+    });
+    maybeInterrupt(interruptionPoint, "binding-active");
+    await finishAdoptionActivation(paths, { phase: "binding-active" }, activationGate, true);
+    maybeInterrupt(interruptionPoint, "launchd-loaded");
+    await recoverAdoption(paths, activationGate);
+    return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+  } catch (error) {
+    if (!journalStarted) removeDeploymentTree(workRoot);
+    throw error;
+  } finally {
+    releaseLock();
+  }
+}
+
+export async function installV3({
+  home,
+  projectRoot,
+  deploymentRoot: overrideRoot,
+  qualificationGate,
+  postActivationGate,
+}) {
+  const paths = deploymentPaths(home, overrideRoot);
+  if (existsSync(join(paths.deploymentRoot, "adoption"))) {
+    return adoptRuntimeBindingV3({
+      home,
+      projectRoot,
+      deploymentRoot: overrideRoot,
+      qualificationGate,
+      postActivationGate,
+    });
+  }
+  if (existsSync(paths.statePath)) {
+    const state = readOwnedJson(paths.statePath);
+    if (state.version !== DEPLOYMENT_VERSION) throw new Error("deployment-state-version-invalid");
+    if (state.runtimeBindingVersion !== 1) {
+      return adoptRuntimeBindingV3({
+        home,
+        projectRoot,
+        deploymentRoot: overrideRoot,
+        qualificationGate,
+        postActivationGate,
+      });
+    }
+    return deploymentStatusV3({ home, deploymentRoot: overrideRoot });
+  }
   if (existsSync(paths.deploymentRoot)) throw new Error("deployment-v3-path-exists");
   const legacyState = verifyLegacyDeployment(paths);
   const stagingRoot = `${paths.deploymentRoot}.candidate-${process.pid}-${randomUUID()}`;
