@@ -246,12 +246,14 @@ async function runtimeLifecycleFixture() {
   mkdirSync(dirname(oldNode), { recursive: true, mode: 0o700 });
 
   const controllerFiles = [
+    "bounded-json.mjs",
     "deployment-controller.mjs",
     "operation-audit.mjs",
     "release-manager.mjs",
     "release-transaction.mjs",
     "runtime-adoption.mjs",
     "runtime-binding.mjs",
+    "supply-chain-policy.json",
     "update-local.mjs",
   ];
   for (const file of controllerFiles) {

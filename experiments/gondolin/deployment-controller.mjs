@@ -19,6 +19,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { readBoundedJsonResponse } from "./bounded-json.mjs";
 
 import {
   PI_PACKAGE_NAME,
@@ -60,7 +63,7 @@ import {
 
 const DEPLOYMENT_VERSION = 3;
 const LAUNCH_AGENT_LABEL = "dev.pi-gondolin.transactional-update";
-const LATEST_RELEASE_URL = "https://pi.dev/api/latest-version";
+const SUPPLY_CHAIN_POLICY_PATH = fileURLToPath(new URL("./supply-chain-policy.json", import.meta.url));
 const PACKAGE_RELATIVE_PATH = join("node_modules", "@earendil-works", "pi-coding-agent");
 const GUARDED_RPC_ENTRY = "#!/usr/bin/env node\nprocess.stderr.write(\"pi-rpc-launcher-required\\n\");\nprocess.exit(64);\n";
 const ACCEPTED_LICENSES = new Set([
@@ -84,6 +87,13 @@ const RUNTIME_EXPERIMENT_FILES = [
   "safe-rpc-launcher.mjs",
   "sandbox.mjs",
   "snapshot.mjs",
+];
+const SUPPLY_CHAIN_POLICY_KEYS = [
+  "profile",
+  "registryUrl",
+  "releaseDescriptorUrl",
+  "sovereigntyStatus",
+  "version",
 ];
 
 function isOwned(stats) {
@@ -160,6 +170,86 @@ function readOwnedJson(path) {
 
 function writeOwnedJson(path, value) {
   atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function validatedHttpsUrl(value, code) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(code);
+  }
+  if (url.protocol !== "https:"
+    || url.username !== ""
+    || url.password !== ""
+    || url.hash !== "") {
+    throw new Error(code);
+  }
+  return url.href;
+}
+
+export function validateSupplyChainPolicy(policy) {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("supply-chain-policy-schema-invalid");
+  }
+  const keys = Object.keys(policy).sort();
+  if (keys.length !== SUPPLY_CHAIN_POLICY_KEYS.length
+    || keys.some((key, index) => key !== SUPPLY_CHAIN_POLICY_KEYS[index])) {
+    throw new Error("supply-chain-policy-schema-invalid");
+  }
+  if (policy.version !== 1) throw new Error("supply-chain-policy-version-invalid");
+  const profileValid = policy.profile === "upstream-exception"
+    && policy.sovereigntyStatus === "not-sovereign";
+  if (!profileValid) throw new Error("supply-chain-policy-profile-invalid");
+  const releaseDescriptorUrl = validatedHttpsUrl(
+    policy.releaseDescriptorUrl,
+    "supply-chain-policy-descriptor-url-invalid",
+  );
+  const registryUrl = validatedHttpsUrl(policy.registryUrl, "supply-chain-policy-registry-url-invalid");
+  if (!registryUrl.endsWith("/")) throw new Error("supply-chain-policy-registry-url-invalid");
+  return { ...policy, releaseDescriptorUrl, registryUrl };
+}
+
+export function readSupplyChainPolicy(policyPath = SUPPLY_CHAIN_POLICY_PATH) {
+  const stats = lstatSync(policyPath);
+  if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats) || stats.size > 16 * 1024) {
+    throw new Error("supply-chain-policy-file-unsafe");
+  }
+  let policy;
+  try {
+    policy = JSON.parse(readFileSync(policyPath, "utf8"));
+  } catch {
+    throw new Error("supply-chain-policy-json-invalid");
+  }
+  return validateSupplyChainPolicy(policy);
+}
+
+export function registryViewArguments(policy, packageName, version) {
+  return [
+    "view",
+    `${packageName}@${version}`,
+    "dist.integrity",
+    "--json",
+    "--registry",
+    policy.registryUrl,
+  ];
+}
+
+export function candidateInstallArguments(policy, candidateRoot, release) {
+  return [
+    "install",
+    "--prefix",
+    candidateRoot,
+    "--ignore-scripts",
+    "--omit=dev",
+    "--no-audit",
+    "--no-fund",
+    "--save-exact",
+    "--min-release-age=0",
+    "--registry",
+    policy.registryUrl,
+    `${release.packageName}@${release.version}`,
+  ];
 }
 
 function symlinkResolvesTo(path, expected) {
@@ -513,12 +603,14 @@ function copyRuntime(projectRoot, stagingRoot) {
   const runtimeRoot = join(controllerRoot, "runtime");
   ensureOwnedDirectory(controllerRoot);
   ensureOwnedDirectory(runtimeRoot);
+  cpSync(join(projectRoot, "experiments", "gondolin", "bounded-json.mjs"), join(controllerRoot, "bounded-json.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "operation-audit.mjs"), join(controllerRoot, "operation-audit.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "release-manager.mjs"), join(controllerRoot, "release-manager.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "release-transaction.mjs"), join(controllerRoot, "release-transaction.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "runtime-adoption.mjs"), join(controllerRoot, "runtime-adoption.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "runtime-binding.mjs"), join(controllerRoot, "runtime-binding.mjs"));
   cpSync(join(projectRoot, "experiments", "gondolin", "deployment-controller.mjs"), join(controllerRoot, "deployment-controller.mjs"));
+  cpSync(join(projectRoot, "experiments", "gondolin", "supply-chain-policy.json"), join(controllerRoot, "supply-chain-policy.json"));
   cpSync(join(projectRoot, "experiments", "gondolin", "update-local.mjs"), join(controllerRoot, "update-local.mjs"));
 
   const targetExperiment = join(runtimeRoot, "experiments", "gondolin");
@@ -536,12 +628,14 @@ function copyRuntime(projectRoot, stagingRoot) {
   cpSync(join(projectRoot, "scripts", "sandbox-license-audit.mjs"), join(runtimeRoot, "scripts", "sandbox-license-audit.mjs"));
 
   const controllerFiles = [
+    "controller/bounded-json.mjs",
     "controller/deployment-controller.mjs",
     "controller/operation-audit.mjs",
     "controller/release-manager.mjs",
     "controller/release-transaction.mjs",
     "controller/runtime-adoption.mjs",
     "controller/runtime-binding.mjs",
+    "controller/supply-chain-policy.json",
     "controller/update-local.mjs",
   ];
   buildCriticalManifest(stagingRoot, controllerFiles, join(stagingRoot, "controller.sha256"));
@@ -815,12 +909,14 @@ function adoptionArtifacts(oldDigests, newDigests) {
 
 function adoptionControllerFiles() {
   return [
+    "controller/bounded-json.mjs",
     "controller/deployment-controller.mjs",
     "controller/operation-audit.mjs",
     "controller/release-manager.mjs",
     "controller/release-transaction.mjs",
     "controller/runtime-adoption.mjs",
     "controller/runtime-binding.mjs",
+    "controller/supply-chain-policy.json",
     "controller/update-local.mjs",
   ];
 }
@@ -828,12 +924,14 @@ function adoptionControllerFiles() {
 function stageAdoptionController({ projectRoot, deploymentRoot, stagingRoot }) {
   cpSync(join(deploymentRoot, "controller"), join(stagingRoot, "controller"), { recursive: true });
   for (const file of [
+    "bounded-json.mjs",
     "deployment-controller.mjs",
     "operation-audit.mjs",
     "release-manager.mjs",
     "release-transaction.mjs",
     "runtime-adoption.mjs",
     "runtime-binding.mjs",
+    "supply-chain-policy.json",
     "update-local.mjs",
   ]) {
     cpSync(join(projectRoot, "experiments", "gondolin", file), join(stagingRoot, "controller", file));
@@ -1567,14 +1665,26 @@ export function disableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }
   }
 }
 
-async function fetchLatestRelease() {
-  const response = await fetch(LATEST_RELEASE_URL, { signal: AbortSignal.timeout(15_000) });
-  if (!response.ok) throw new Error("latest-release-request-refused");
-  return response.json();
+async function fetchLatestRelease(policy) {
+  const response = await fetch(policy.releaseDescriptorUrl, {
+    method: "GET",
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error("latest-release-request-refused");
+  }
+  return readBoundedJsonResponse(response, { maxBytes: 128 * 1024 });
 }
 
-function resolveRegistryIntegrity(state, packageName, version) {
-  const result = runCommand(state.npmCommand, ["view", `${packageName}@${version}`, "dist.integrity", "--json"], { timeout: 30_000 });
+function resolveRegistryIntegrity(state, policy, packageName, version) {
+  const result = runCommand(
+    state.npmCommand,
+    registryViewArguments(policy, packageName, version),
+    { timeout: 30_000 },
+  );
   if (!resultPassed(result)) throw new Error("registry-integrity-request-refused");
   let integrity;
   try {
@@ -1586,24 +1696,17 @@ function resolveRegistryIntegrity(state, packageName, version) {
   return integrity;
 }
 
-function installCandidatePackage(state, candidateRoot, release) {
+function installCandidatePackage(state, policy, candidateRoot, release) {
   ensureOwnedDirectory(candidateRoot);
   writeFileSync(join(candidateRoot, "package.json"), `${JSON.stringify({
     private: true,
     dependencies: { [release.packageName]: release.version },
   }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  const result = runCommand(state.npmCommand, [
-    "install",
-    "--prefix",
-    candidateRoot,
-    "--ignore-scripts",
-    "--omit=dev",
-    "--no-audit",
-    "--no-fund",
-    "--save-exact",
-    "--min-release-age=0",
-    `${release.packageName}@${release.version}`,
-  ], { timeout: 180_000 });
+  const result = runCommand(
+    state.npmCommand,
+    candidateInstallArguments(policy, candidateRoot, release),
+    { timeout: 180_000 },
+  );
   if (!resultPassed(result)) throw new Error("candidate-package-install-refused");
   verifyCandidatePackage(candidateRoot, release);
   auditPiPackageLicenses(packageRoot(candidateRoot));
@@ -1725,7 +1828,8 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
     const current = stateAndCurrent(paths);
     state = current.state;
     currentRelease = current.release;
-    const latestPayload = await fetchLatestRelease();
+    const supplyChainPolicy = readSupplyChainPolicy();
+    const latestPayload = await fetchLatestRelease(supplyChainPolicy);
     const validatedTarget = parseLatestRelease(latestPayload, "sha512-AA==");
     const preliminaryVersionOrder = compareVersions(validatedTarget.version, currentRelease.packageVersion);
     if (preliminaryVersionOrder < 0) throw new Error("release-downgrade-refused");
@@ -1739,7 +1843,12 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
         auditComplete: true,
       };
     }
-    const integrity = resolveRegistryIntegrity(state, validatedTarget.packageName, validatedTarget.version);
+    const integrity = resolveRegistryIntegrity(
+      state,
+      supplyChainPolicy,
+      validatedTarget.packageName,
+      validatedTarget.version,
+    );
     release = parseLatestRelease(latestPayload, integrity);
     const releaseId = releaseIdFor(release);
     attemptedReleaseId = releaseId;
@@ -1776,7 +1885,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
     const candidateRoot = join(candidatesRoot, releaseId);
     ensureOwnedDirectory(candidatesRoot);
     removeOwnedCandidate(candidateRoot, candidatesRoot);
-    installCandidatePackage(state, candidateRoot, release);
+    installCandidatePackage(state, supplyChainPolicy, candidateRoot, release);
     const before = releaseTransactionSnapshot(paths, state);
     const nextState = copyDeploymentState(state);
     nextState.currentRelease = releaseId;

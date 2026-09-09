@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "profile": "upstream-exception",
+  "sovereigntyStatus": "not-sovereign",
+  "releaseDescriptorUrl": "https://pi.dev/api/latest-version",
+  "registryUrl": "https://registry.npmjs.org/"
+}
