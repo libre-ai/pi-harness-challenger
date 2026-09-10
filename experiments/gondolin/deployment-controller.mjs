@@ -18,7 +18,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readBoundedJsonResponse } from "./bounded-json.mjs";
@@ -33,7 +33,9 @@ import {
   parseLatestRelease,
   promoteCandidate,
   releaseIdFor,
+  removeNpmBinDirectories,
   rollbackRelease,
+  upgradeReleaseManifest,
   verifyCompleteReleaseManifest,
   verifyCriticalManifest,
 } from "./release-manager.mjs";
@@ -46,6 +48,7 @@ import {
 import {
   advanceRuntimeAdoption,
   beginRuntimeAdoption,
+  inspectRuntimeAdoption,
   recoverRuntimeAdoption,
 } from "./runtime-adoption.mjs";
 import {
@@ -64,6 +67,8 @@ import {
 } from "./release-transaction.mjs";
 
 const DEPLOYMENT_VERSION = 3;
+const CONTROLLER_REVISION = 2;
+const STORED_NODE_PATH = "node-current/node";
 const LAUNCH_AGENT_LABEL = "dev.pi-gondolin.transactional-update";
 const SUPPLY_CHAIN_POLICY_PATH = fileURLToPath(new URL("./supply-chain-policy.json", import.meta.url));
 const PACKAGE_RELATIVE_PATH = join("node_modules", "@earendil-works", "pi-coding-agent");
@@ -96,6 +101,17 @@ const SUPPLY_CHAIN_POLICY_KEYS = [
   "releaseDescriptorUrl",
   "sovereigntyStatus",
   "version",
+];
+const CONTROLLER_SOURCE_FILES = [
+  "bounded-json.mjs",
+  "deployment-controller.mjs",
+  "operation-audit.mjs",
+  "release-manager.mjs",
+  "release-transaction.mjs",
+  "runtime-adoption.mjs",
+  "runtime-binding.mjs",
+  "supply-chain-policy.json",
+  "update-local.mjs",
 ];
 
 function isOwned(stats) {
@@ -374,21 +390,6 @@ function guardCandidateRpcEntry(candidateRoot) {
   return { originalPath, guardedSha256: sha256(paths.rpcEntry), originalSha256: sha256(originalPath) };
 }
 
-function removeNpmBinDirectories(current) {
-  for (const entry of readdirSync(current, { withFileTypes: true })) {
-    const path = join(current, entry.name);
-    const stats = lstatSync(path);
-    if (entry.name === ".bin") {
-      if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
-        throw new Error("candidate-bin-directory-unsafe");
-      }
-      rmSync(path, { recursive: true });
-      continue;
-    }
-    if (stats.isDirectory() && !stats.isSymbolicLink()) removeNpmBinDirectories(path);
-  }
-}
-
 function writeReleaseMetadata(candidateRoot, release, source, rpcEntry) {
   const metadata = {
     version: 1,
@@ -449,6 +450,8 @@ export function renderLaunchAgentPlist({ home, deploymentRoot, piWrapperPath, qe
     <string>${xmlEscape(home)}</string>
     <key>PI_GONDOLIN_DEPLOYMENT_ROOT</key>
     <string>${xmlEscape(deploymentRoot)}</string>
+    <key>PI_GONDOLIN_UPDATE_TRIGGER</key>
+    <string>automatic</string>
     <key>PATH</key>
     <string>${xmlEscape(executablePath)}</string>
   </dict>
@@ -467,14 +470,22 @@ export function renderLaunchAgentPlist({ home, deploymentRoot, piWrapperPath, qe
 `;
 }
 
-export function renderStablePiWrapper({ deploymentRoot, nodePath, nodeRecoveryPath, launcherPath }) {
+export function renderStablePiWrapper({ nodeRecoveryPath }) {
   return `#!/bin/sh
 set -eu
-ROOT=${shellQuote(deploymentRoot)}
-NODE=${shellQuote(nodePath)}
 RECOVERY_NODE=${shellQuote(nodeRecoveryPath)}
-LAUNCHER=${shellQuote(launcherPath)}
 refuse() { printf '%s\\n' 'pi-gondolin-deployment-integrity-refused' >&2; exit 65; }
+SCRIPT=$0
+while [ -L "$SCRIPT" ]; do
+  LINK=$(/usr/bin/readlink "$SCRIPT") || refuse
+  case "$LINK" in
+    /*) SCRIPT=$LINK ;;
+    *) SCRIPT=$(/usr/bin/dirname "$SCRIPT")/$LINK ;;
+  esac
+done
+ROOT=$(CDPATH= cd -P "$(/usr/bin/dirname "$SCRIPT")" && /bin/pwd -P) || refuse
+NODE="$ROOT/node-current/node"
+LAUNCHER="$ROOT/controller/runtime/experiments/gondolin/safe-rpc-launcher.mjs"
 (
   cd "$ROOT"
   /usr/bin/shasum -a 256 -c controller.sha256 >/dev/null 2>&1
@@ -485,6 +496,7 @@ if [ ! -x "$NODE" ]; then
     HOME="$HOME" \\
     PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' \\
     PI_GONDOLIN_DEPLOYMENT_ROOT="$ROOT" \\
+    PI_GONDOLIN_UPDATE_TRIGGER='recovery' \\
     TMPDIR="$ROOT/tmp" \\
     "$RECOVERY_NODE" "$ROOT/controller/update-local.mjs" runtime-repin >/dev/null 2>&1 || refuse
   [ -x "$NODE" ] || refuse
@@ -532,14 +544,22 @@ exec "$NODE" "$REAL_PI" "$@"
 `;
 }
 
-export function renderStableLauncherWrapper({ deploymentRoot, nodePath, nodeRecoveryPath, launcherPath }) {
+export function renderStableLauncherWrapper({ nodeRecoveryPath }) {
   return `#!/bin/sh
 set -eu
-ROOT=${shellQuote(deploymentRoot)}
-NODE=${shellQuote(nodePath)}
 RECOVERY_NODE=${shellQuote(nodeRecoveryPath)}
-LAUNCHER=${shellQuote(launcherPath)}
 refuse() { printf '%s\\n' 'gondolin-rpc-deployment-integrity-refused' >&2; exit 65; }
+SCRIPT=$0
+while [ -L "$SCRIPT" ]; do
+  LINK=$(/usr/bin/readlink "$SCRIPT") || refuse
+  case "$LINK" in
+    /*) SCRIPT=$LINK ;;
+    *) SCRIPT=$(/usr/bin/dirname "$SCRIPT")/$LINK ;;
+  esac
+done
+ROOT=$(CDPATH= cd -P "$(/usr/bin/dirname "$SCRIPT")" && /bin/pwd -P) || refuse
+NODE="$ROOT/node-current/node"
+LAUNCHER="$ROOT/controller/runtime/experiments/gondolin/safe-rpc-launcher.mjs"
 (
   cd "$ROOT"
   /usr/bin/shasum -a 256 -c controller.sha256 >/dev/null 2>&1
@@ -551,6 +571,7 @@ if [ ! -x "$NODE" ]; then
     HOME="$HOME" \\
     PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' \\
     PI_GONDOLIN_DEPLOYMENT_ROOT="$ROOT" \\
+    PI_GONDOLIN_UPDATE_TRIGGER='recovery' \\
     TMPDIR="$ROOT/tmp" \\
     "$RECOVERY_NODE" "$ROOT/controller/update-local.mjs" runtime-repin >/dev/null 2>&1 || refuse
   [ -x "$NODE" ] || refuse
@@ -766,14 +787,30 @@ function resolveNpmCommand() {
 }
 
 export function buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath, npmPath }) {
-  const nodePath = join(deploymentRoot, "node-current", "node");
+  resolveStoredNodePath(deploymentRoot, STORED_NODE_PATH);
   return {
     version: DEPLOYMENT_VERSION,
+    controllerRevision: CONTROLLER_REVISION,
     runtimeBindingVersion: 1,
-    nodePath,
+    nodePath: STORED_NODE_PATH,
     nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
-    npmCommand: [nodePath, npmPath],
+    npmCommand: [STORED_NODE_PATH, npmPath],
   };
+}
+
+export function resolveStoredNodePath(deploymentRoot, storedPath) {
+  if (typeof deploymentRoot !== "string"
+    || !isAbsolute(deploymentRoot)
+    || deploymentRoot.includes("\0")
+    || deploymentRoot.includes("\n")
+    || deploymentRoot.includes("\r")
+    || storedPath !== STORED_NODE_PATH) {
+    throw new Error("deployment-runtime-path-invalid");
+  }
+  const resolvedPath = resolve(deploymentRoot, storedPath);
+  const rootPrefix = deploymentRoot.endsWith(sep) ? deploymentRoot : `${deploymentRoot}${sep}`;
+  if (!resolvedPath.startsWith(rootPrefix)) throw new Error("deployment-runtime-path-invalid");
+  return resolvedPath;
 }
 
 export function qualificationEnvironment(overrides = {}, baseEnvironment) {
@@ -794,8 +831,15 @@ export function qualificationEnvironment(overrides = {}, baseEnvironment) {
   };
 }
 
-function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath, environment }) {
-  if (!verifyRelease(releaseRoot)) return false;
+function qualifyRelease({
+  deploymentRoot,
+  releaseRoot,
+  nodePath,
+  launcherPath,
+  environment,
+  integrityVerifier = verifyRelease,
+}) {
+  if (!integrityVerifier(releaseRoot, join(releaseRoot, "critical.sha256"))) return false;
   const metadata = readReleaseMetadata(releaseRoot);
   const paths = packagePaths(releaseRoot);
   try {
@@ -880,16 +924,15 @@ function qualifyRelease({ deploymentRoot, releaseRoot, nodePath, launcherPath, e
   }
 }
 
-function writeDeploymentWrappers(stagingRoot, finalRoot, nodePath, nodeRecoveryPath) {
-  const launcherPath = join(finalRoot, "controller", "runtime", "experiments", "gondolin", "safe-rpc-launcher.mjs");
+function writeDeploymentWrappers(stagingRoot, nodeRecoveryPath) {
   atomicWrite(
     join(stagingRoot, "pi"),
-    renderStablePiWrapper({ deploymentRoot: finalRoot, nodePath, nodeRecoveryPath, launcherPath }),
+    renderStablePiWrapper({ nodeRecoveryPath }),
     0o700,
   );
   atomicWrite(
     join(stagingRoot, "pi-gondolin-rpc"),
-    renderStableLauncherWrapper({ deploymentRoot: finalRoot, nodePath, nodeRecoveryPath, launcherPath }),
+    renderStableLauncherWrapper({ nodeRecoveryPath }),
     0o700,
   );
 }
@@ -970,39 +1013,40 @@ function adoptionArtifacts(oldDigests, newDigests) {
 }
 
 function adoptionControllerFiles() {
-  return [
-    "controller/bounded-json.mjs",
-    "controller/deployment-controller.mjs",
-    "controller/operation-audit.mjs",
-    "controller/release-manager.mjs",
-    "controller/release-transaction.mjs",
-    "controller/runtime-adoption.mjs",
-    "controller/runtime-binding.mjs",
-    "controller/supply-chain-policy.json",
-    "controller/update-local.mjs",
-  ];
+  return CONTROLLER_SOURCE_FILES.map((file) => `controller/${file}`);
+}
+
+function controllerSourcesMatchProject({ paths, projectRoot }) {
+  try {
+    return CONTROLLER_SOURCE_FILES.every((file) => {
+      const sourcePath = join(projectRoot, "experiments", "gondolin", file);
+      const deployedPath = join(paths.deploymentRoot, "controller", file);
+      const sourceStats = lstatSync(sourcePath);
+      const deployedStats = lstatSync(deployedPath);
+      return sourceStats.isFile()
+        && !sourceStats.isSymbolicLink()
+        && deployedStats.isFile()
+        && !deployedStats.isSymbolicLink()
+        && isOwned(deployedStats)
+        && sha256(sourcePath) === sha256(deployedPath);
+    });
+  } catch {
+    return false;
+  }
 }
 
 function stageAdoptionController({ projectRoot, deploymentRoot, stagingRoot }) {
   cpSync(join(deploymentRoot, "controller"), join(stagingRoot, "controller"), { recursive: true });
-  for (const file of [
-    "bounded-json.mjs",
-    "deployment-controller.mjs",
-    "operation-audit.mjs",
-    "release-manager.mjs",
-    "release-transaction.mjs",
-    "runtime-adoption.mjs",
-    "runtime-binding.mjs",
-    "supply-chain-policy.json",
-    "update-local.mjs",
-  ]) {
+  for (const file of CONTROLLER_SOURCE_FILES) {
     cpSync(join(projectRoot, "experiments", "gondolin", file), join(stagingRoot, "controller", file));
   }
   buildCriticalManifest(stagingRoot, adoptionControllerFiles(), join(stagingRoot, "controller.sha256"));
 }
 
-function maybeInterrupt(interruptionPoint, phase) {
-  if (interruptionPoint === phase) throw new Error("adoption-test-interruption");
+function maybeInterrupt(interruptionPoint, phase, interruptionHandler) {
+  if (interruptionPoint !== phase) return;
+  if (interruptionHandler) interruptionHandler(phase);
+  throw new Error("adoption-test-interruption");
 }
 
 function replaceAdoptionArtifact(livePath, stagedPath, backupPath) {
@@ -1020,6 +1064,19 @@ function stagedBindingId(stagedBindingRoot) {
 
 function activateAdoptionBinding(paths) {
   const stagedBindingRoot = join(paths.deploymentRoot, "adoption", "staged", "node-binding");
+  if (!existsSync(stagedBindingRoot)) {
+    if (existsSync(join(paths.deploymentRoot, "node-current"))) {
+      inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: true });
+      return;
+    }
+    const bindingsRoot = join(paths.deploymentRoot, "node-bindings");
+    const bindings = readdirSync(bindingsRoot)
+      .filter((entry) => /^node-[0-9A-Za-z.+-]+-[a-f0-9]{12}$/.test(entry));
+    if (bindings.length !== 1) throw new Error("adoption-binding-state-unsafe");
+    atomicSymlink(`node-bindings/${bindings[0]}`, join(paths.deploymentRoot, "node-current"));
+    inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: true });
+    return;
+  }
   const bindingsRoot = join(paths.deploymentRoot, "node-bindings");
   ensureOwnedDirectory(bindingsRoot);
   let bindingId;
@@ -1043,8 +1100,11 @@ function activateAdoptionBinding(paths) {
 function restoreAdoptionBackups(paths, journal) {
   const backupRoot = join(paths.deploymentRoot, "adoption", "backups");
   if (existsSync(join(backupRoot, "deployment.json"))) {
-    rmSync(join(paths.deploymentRoot, "node-current"), { force: true });
-    removeDeploymentTree(join(paths.deploymentRoot, "node-bindings"));
+    const previousState = readOwnedJson(join(backupRoot, "deployment.json"));
+    if (previousState.runtimeBindingVersion !== 1) {
+      rmSync(join(paths.deploymentRoot, "node-current"), { force: true });
+      removeDeploymentTree(join(paths.deploymentRoot, "node-bindings"));
+    }
   }
   const replacements = [
     ["controller", join(paths.deploymentRoot, "controller")],
@@ -1182,12 +1242,16 @@ export async function adoptRuntimeBindingV3({
   projectRoot,
   deploymentRoot: overrideRoot,
   interruptionPoint,
+  interruptionHandler,
   qualificationGate,
   postActivationGate,
 }) {
   if (interruptionPoint !== undefined
     && !["prepared", "artifacts-installed", "binding-active", "launchd-loaded"].includes(interruptionPoint)) {
     throw new Error("adoption-test-interruption-point-invalid");
+  }
+  if (interruptionHandler !== undefined && typeof interruptionHandler !== "function") {
+    throw new Error("adoption-test-interruption-handler-invalid");
   }
   if (qualificationGate !== undefined && typeof qualificationGate !== "function") {
     throw new Error("node-runtime-qualification-gate-invalid");
@@ -1199,6 +1263,7 @@ export async function adoptRuntimeBindingV3({
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
   const workRoot = join(paths.deploymentRoot, `.adoption-candidate-${process.pid}-${randomUUID()}`);
   let journalStarted = false;
+  let audit = null;
   try {
     ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
     const environment = buildRecoveryEnvironment({ deploymentRoot: paths.deploymentRoot, home });
@@ -1206,38 +1271,79 @@ export async function adoptRuntimeBindingV3({
       const { release } = stateAndCurrent(paths);
       return postActivationSmoke(paths, release.packageVersion, environment);
     });
+    const pendingAdoption = inspectRuntimeAdoption({ deploymentRoot: paths.deploymentRoot });
     const recovered = await recoverAdoption(paths, activationGate);
+    let recoveredAuditResult = null;
+    if (recovered !== "none" && pendingAdoption?.operationId) {
+      try {
+        recoveredAuditResult = finishReleaseAudit(paths, pendingAdoption.operationId, "recovered", null);
+      } catch {
+        recoveredAuditResult = { operationId: pendingAdoption.operationId, auditComplete: false };
+      }
+    }
     if (recovered === "completed") {
-      return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+      return {
+        ...deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot }),
+        ...(recoveredAuditResult ?? { operationId: null, auditComplete: true }),
+      };
     }
     removeOrphanedAdoptionCandidates(paths.deploymentRoot);
     const { state, releaseRoot } = stateAndCurrent(paths);
-    if (state.runtimeBindingVersion === 1) {
+    const refreshingController = state.runtimeBindingVersion === 1;
+    if (refreshingController
+      && state.controllerRevision === CONTROLLER_REVISION
+      && controllerSourcesMatchProject({ paths, projectRoot })) {
       return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
     }
     const staticStatus = deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
-    if (!staticStatus.staticIntegrityPassed) throw new Error("deployment-pre-adoption-invalid");
-    if (existsSync(join(paths.deploymentRoot, "node-current"))
-      || existsSync(join(paths.deploymentRoot, "node-bindings"))) {
-      throw new Error("adoption-binding-state-unsafe");
+    let candidateNodePath;
+    if (refreshingController) {
+      const partialReleaseValid = verifyCriticalManifest(releaseRoot, join(releaseRoot, "critical.sha256"));
+      const refreshIntegrityPassed = partialReleaseValid
+        && currentReleaseId(paths) === state.currentRelease
+        && staticStatus.controllerManifestMatched
+        && staticStatus.runtimeManifestMatched
+        && staticStatus.wrappersInstalled
+        && staticStatus.wrapperHashesMatched
+        && staticStatus.runtimeConfigurationMatched
+        && staticStatus.runtimeExecutable
+        && staticStatus.releaseTransactionSafe
+        && !staticStatus.releaseTransactionIncomplete;
+      if (!refreshIntegrityPassed) throw new Error("deployment-pre-refresh-invalid");
+      candidateNodePath = inspectRuntimeBinding({
+        deploymentRoot: paths.deploymentRoot,
+        requireExecutable: true,
+      }).canonicalNodePath;
+    } else {
+      if (!staticStatus.staticIntegrityPassed) throw new Error("deployment-pre-adoption-invalid");
+      if (existsSync(join(paths.deploymentRoot, "node-current"))
+        || existsSync(join(paths.deploymentRoot, "node-bindings"))) {
+        throw new Error("adoption-binding-state-unsafe");
+      }
+      const oldAnchor = homebrewRecoveryAnchor(state.nodePath);
+      candidateNodePath = staticStatus.runtimeExecutable ? realpathSync(state.nodePath) : realpathSync(process.execPath);
+      if (homebrewRecoveryAnchor(candidateNodePath) !== oldAnchor) throw new Error("node-runtime-recovery-mismatch");
+      if (!staticStatus.runtimeExecutable && realpathSync(oldAnchor) !== candidateNodePath) {
+        throw new Error("node-runtime-recovery-mismatch");
+      }
     }
-    const oldAnchor = homebrewRecoveryAnchor(state.nodePath);
-    const candidateNodePath = staticStatus.runtimeExecutable ? realpathSync(state.nodePath) : realpathSync(process.execPath);
-    if (homebrewRecoveryAnchor(candidateNodePath) !== oldAnchor) throw new Error("node-runtime-recovery-mismatch");
-    if (!staticStatus.runtimeExecutable && realpathSync(oldAnchor) !== candidateNodePath) {
-      throw new Error("node-runtime-recovery-mismatch");
-    }
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "runtime-adoption",
+      trigger: "manual",
+      targetId: null,
+    });
     ensureOwnedDirectory(workRoot);
     const stagedRoot = join(workRoot, "staged");
     ensureOwnedDirectory(stagedRoot);
     stageAdoptionController({ projectRoot, deploymentRoot: paths.deploymentRoot, stagingRoot: stagedRoot });
-    const [, npmPath] = resolveNpmCommand();
+    const npmPath = refreshingController ? state.npmCommand[1] : resolveNpmCommand()[1];
     const runtimeState = buildDeploymentRuntimeState({
       deploymentRoot: paths.deploymentRoot,
       canonicalNodePath: candidateNodePath,
       npmPath,
     });
-    writeDeploymentWrappers(stagedRoot, paths.deploymentRoot, runtimeState.nodePath, runtimeState.nodeRecoveryPath);
+    writeDeploymentWrappers(stagedRoot, runtimeState.nodeRecoveryPath);
     const nextState = {
       ...state,
       ...runtimeState,
@@ -1257,46 +1363,60 @@ export async function adoptRuntimeBindingV3({
       nextState.automation = { ...state.automation, plistSha256: sha256(join(stagedRoot, "launchd")) };
     }
     writeOwnedJson(join(stagedRoot, "deployment.json"), nextState);
-    const bindingDeploymentRoot = join(workRoot, "binding");
-    ensureOwnedDirectory(bindingDeploymentRoot);
     const gate = qualificationGate ?? ((context) => qualifyRelease({
       deploymentRoot: paths.deploymentRoot,
       releaseRoot: context.releaseRoot,
       nodePath: context.candidateNodePath,
       launcherPath: paths.launcherPath,
       environment: context.environment,
+      integrityVerifier: context.integrityVerifier,
     }));
-    const binding = await promoteRuntimeBinding({
-      deploymentRoot: bindingDeploymentRoot,
-      canonicalNodePath: candidateNodePath,
-      nodeVersion: readNodeVersion(candidateNodePath, environment),
-      qualifiedAt: new Date().toISOString(),
-      source: "v3-adoption",
-      qualificationGate: async () => gate({ candidateNodePath, releaseRoot, environment }),
-    });
-    const stagedBindingRoot = join(stagedRoot, "node-binding");
-    chmodSync(binding.bindingRoot, 0o700);
-    renameSync(binding.bindingRoot, stagedBindingRoot);
-    chmodSync(stagedBindingRoot, 0o500);
+    const bindingDeploymentRoot = join(workRoot, "binding");
+    if (refreshingController) {
+      await upgradeReleaseManifest({
+        releaseRoot,
+        qualificationGate: async () => gate({
+          candidateNodePath,
+          releaseRoot,
+          environment,
+          integrityVerifier: verifyCriticalManifest,
+        }),
+      });
+    } else {
+      ensureOwnedDirectory(bindingDeploymentRoot);
+      const binding = await promoteRuntimeBinding({
+        deploymentRoot: bindingDeploymentRoot,
+        canonicalNodePath: candidateNodePath,
+        nodeVersion: readNodeVersion(candidateNodePath, environment),
+        qualifiedAt: new Date().toISOString(),
+        source: "v3-adoption",
+        qualificationGate: async () => gate({ candidateNodePath, releaseRoot, environment }),
+      });
+      const stagedBindingRoot = join(stagedRoot, "node-binding");
+      chmodSync(binding.bindingRoot, 0o700);
+      renameSync(binding.bindingRoot, stagedBindingRoot);
+      chmodSync(stagedBindingRoot, 0o500);
+    }
     const oldDigests = adoptionArtifactDigests(paths);
     const stagedPaths = { ...paths, deploymentRoot: stagedRoot, statePath: join(stagedRoot, "deployment.json"), piWrapper: join(stagedRoot, "pi"), launcherWrapper: join(stagedRoot, "pi-gondolin-rpc"), launchAgentPath: join(stagedRoot, "launchd") };
     const newDigests = adoptionArtifactDigests(stagedPaths);
     beginRuntimeAdoption({
       deploymentRoot: paths.deploymentRoot,
       artifacts: adoptionArtifacts(oldDigests, newDigests),
+      operationId: audit.operationId,
     });
     journalStarted = true;
     renameSync(stagedRoot, join(paths.deploymentRoot, "adoption", "staged"));
     removeDeploymentTree(bindingDeploymentRoot);
     removeDeploymentTree(workRoot);
-    maybeInterrupt(interruptionPoint, "prepared");
+    maybeInterrupt(interruptionPoint, "prepared", interruptionHandler);
     installAdoptionArtifacts(paths);
     advanceRuntimeAdoption({
       deploymentRoot: paths.deploymentRoot,
       expectedPhase: "prepared",
       nextPhase: "artifacts-installed",
     });
-    maybeInterrupt(interruptionPoint, "artifacts-installed");
+    maybeInterrupt(interruptionPoint, "artifacts-installed", interruptionHandler);
     activateAdoptionBinding(paths);
     if (!await activationGate()) throw new Error("adoption-post-activation-refused");
     advanceRuntimeAdoption({
@@ -1304,13 +1424,27 @@ export async function adoptRuntimeBindingV3({
       expectedPhase: "artifacts-installed",
       nextPhase: "binding-active",
     });
-    maybeInterrupt(interruptionPoint, "binding-active");
+    maybeInterrupt(interruptionPoint, "binding-active", interruptionHandler);
     await finishAdoptionActivation(paths, { phase: "binding-active" }, activationGate, true);
-    maybeInterrupt(interruptionPoint, "launchd-loaded");
+    maybeInterrupt(interruptionPoint, "launchd-loaded", interruptionHandler);
     await recoverAdoption(paths, activationGate);
-    return deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
+    let auditResult;
+    try {
+      auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    } catch {
+      auditResult = { operationId: audit.operationId, auditComplete: false };
+    }
+    return {
+      ...deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot }),
+      ...auditResult,
+      recoveredOperationId: recoveredAuditResult?.operationId ?? null,
+      recoveredAuditComplete: recoveredAuditResult?.auditComplete ?? true,
+    };
   } catch (error) {
     if (!journalStarted) removeDeploymentTree(workRoot);
+    if (audit !== null && !journalStarted) {
+      finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+    }
     throw error;
   } finally {
     releaseLock();
@@ -1337,7 +1471,9 @@ export async function installV3({
   if (existsSync(paths.statePath)) {
     const state = readOwnedJson(paths.statePath);
     if (state.version !== DEPLOYMENT_VERSION) throw new Error("deployment-state-version-invalid");
-    if (state.runtimeBindingVersion !== 1) {
+    if (state.runtimeBindingVersion !== 1
+      || state.controllerRevision !== CONTROLLER_REVISION
+      || !controllerSourcesMatchProject({ paths, projectRoot })) {
       return adoptRuntimeBindingV3({
         home,
         projectRoot,
@@ -1367,12 +1503,7 @@ export async function installV3({
     });
     ensureOwnedDirectory(join(stagingRoot, "tmp"));
     const installEnvironment = buildRecoveryEnvironment({ deploymentRoot: stagingRoot, home });
-    writeDeploymentWrappers(
-      stagingRoot,
-      paths.deploymentRoot,
-      runtimeState.nodePath,
-      runtimeState.nodeRecoveryPath,
-    );
+    writeDeploymentWrappers(stagingRoot, runtimeState.nodeRecoveryPath);
     await promoteRuntimeBinding({
       deploymentRoot: stagingRoot,
       canonicalNodePath,
@@ -1409,7 +1540,7 @@ export async function installV3({
     if (!postActivationSmoke(paths, migrated.release.version, deployedEnvironment)) {
       throw new Error("migration-post-activation-refused");
     }
-    const e2e = run(state.nodePath, [join(paths.deploymentRoot, "controller", "runtime", "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
+    const e2e = run(resolvedRuntimeNodePath(paths, state), [join(paths.deploymentRoot, "controller", "runtime", "experiments", "gondolin", "deployed-rpc-e2e.mjs")], {
       env: qualificationEnvironment({ PI_GONDOLIN_DEPLOYMENT_ROOT: paths.deploymentRoot }, deployedEnvironment),
       timeout: 240_000,
     });
@@ -1442,6 +1573,36 @@ function checkStaticIntegrity(check) {
   }
 }
 
+function resolvedRuntimeNodePath(paths, state) {
+  if (state.runtimeBindingVersion !== 1) return state.nodePath;
+  if (state.controllerRevision === CONTROLLER_REVISION) {
+    return resolveStoredNodePath(paths.deploymentRoot, state.nodePath);
+  }
+  if ((state.controllerRevision === undefined || state.controllerRevision === 1)
+    && typeof state.nodePath === "string"
+    && isAbsolute(state.nodePath)
+    && relative(dirname(dirname(state.nodePath)), state.nodePath).split(sep).join("/") === STORED_NODE_PATH
+    && realpathSync(dirname(dirname(state.nodePath))) === realpathSync(paths.deploymentRoot)) {
+    return join(paths.deploymentRoot, STORED_NODE_PATH);
+  }
+  throw new Error("deployment-runtime-path-invalid");
+}
+
+function resolvedNpmCommand(paths, state) {
+  if (!Array.isArray(state.npmCommand) || state.npmCommand.length !== 2) {
+    throw new Error("deployment-package-command-invalid");
+  }
+  const expectedStoredNodePath = state.controllerRevision === CONTROLLER_REVISION
+    ? STORED_NODE_PATH
+    : state.nodePath;
+  if (state.npmCommand[0] !== expectedStoredNodePath
+    || typeof state.npmCommand[1] !== "string"
+    || !isAbsolute(state.npmCommand[1])) {
+    throw new Error("deployment-package-command-invalid");
+  }
+  return [resolvedRuntimeNodePath(paths, state), state.npmCommand[1]];
+}
+
 function runtimeConfigurationStatus(paths, state) {
   if (state.runtimeBindingVersion === undefined) {
     const configured = typeof state.nodePath === "string"
@@ -1457,11 +1618,16 @@ function runtimeConfigurationStatus(paths, state) {
 
   const runtimeConfigurationMatched = checkStaticIntegrity(() => {
     inspectRuntimeBinding({ deploymentRoot: paths.deploymentRoot, requireExecutable: false });
-    const stableNodePath = join(paths.deploymentRoot, "node-current", "node");
+    const stableNodePath = resolvedRuntimeNodePath(paths, state);
+    resolvedNpmCommand(paths, state);
+    const expectedStoredNodePath = state.controllerRevision === CONTROLLER_REVISION
+      ? STORED_NODE_PATH
+      : state.nodePath;
     return state.runtimeBindingVersion === 1
-      && state.nodePath === stableNodePath
+      && state.nodePath === expectedStoredNodePath
       && Array.isArray(state.npmCommand)
-      && state.npmCommand[0] === stableNodePath
+      && state.npmCommand[0] === expectedStoredNodePath
+      && stableNodePath === join(paths.deploymentRoot, STORED_NODE_PATH)
       && ["/opt/homebrew/opt/node/bin/node", "/usr/local/opt/node/bin/node"].includes(state.nodeRecoveryPath);
   });
   const runtimeExecutable = runtimeConfigurationMatched && checkStaticIntegrity(() => {
@@ -1563,7 +1729,7 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
     ? run(paths.piWrapper, ["--mode", "rpc"], { env: environment, timeout: 10_000 })
     : refused;
   const rpcEntry = canExecute
-    ? run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { env: environment, timeout: 10_000 })
+    ? run(resolvedRuntimeNodePath(paths, state), [join(packageRoot(releaseRoot), "dist", "rpc-entry.js")], { env: environment, timeout: 10_000 })
     : refused;
   const incomplete = canExecute
     ? run(paths.launcherWrapper, [], {
@@ -1605,6 +1771,7 @@ export function deploymentStatusV3({ home, deploymentRoot: overrideRoot }) {
     && incomplete.stderr === "gondolin-rpc-launcher-refused\n";
   return {
     version: DEPLOYMENT_VERSION,
+    controllerRevision: state.controllerRevision ?? 1,
     deployed,
     profile: state.profile,
     currentVersion: release.packageVersion,
@@ -1631,12 +1798,20 @@ function readNodeVersion(nodePath, environment) {
   return version;
 }
 
-export async function runtimeRepinV3({ home, deploymentRoot: overrideRoot, qualificationGate }) {
+export async function runtimeRepinV3({
+  home,
+  deploymentRoot: overrideRoot,
+  qualificationGate,
+  trigger = "manual",
+}) {
+  if (trigger !== "manual" && trigger !== "recovery") throw new Error("runtime-repin-trigger-invalid");
   if (qualificationGate !== undefined && typeof qualificationGate !== "function") {
     throw new Error("node-runtime-qualification-gate-invalid");
   }
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  let audit = null;
+  let binding = null;
   try {
     const status = deploymentStaticStatusV3({ home, deploymentRoot: paths.deploymentRoot });
     if (!status.staticIntegrityPassed) throw new Error("deployment-pre-repin-invalid");
@@ -1651,6 +1826,12 @@ export async function runtimeRepinV3({ home, deploymentRoot: overrideRoot, quali
       recoveryMatches = false;
     }
     if (!recoveryMatches) throw new Error("node-runtime-recovery-mismatch");
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "runtime-repin",
+      trigger,
+      targetId: null,
+    });
     ensureOwnedDirectory(join(paths.deploymentRoot, "tmp"));
     const environment = buildRecoveryEnvironment({
       deploymentRoot: paths.deploymentRoot,
@@ -1663,7 +1844,7 @@ export async function runtimeRepinV3({ home, deploymentRoot: overrideRoot, quali
       launcherPath: paths.launcherPath,
       environment: context.environment,
     }));
-    return await promoteRuntimeBinding({
+    binding = await promoteRuntimeBinding({
       deploymentRoot: paths.deploymentRoot,
       canonicalNodePath: candidateNodePath,
       nodeVersion: readNodeVersion(candidateNodePath, environment),
@@ -1671,14 +1852,29 @@ export async function runtimeRepinV3({ home, deploymentRoot: overrideRoot, quali
       source: "homebrew-recovery",
       qualificationGate: async () => gate({ candidateNodePath, releaseRoot, environment }),
     });
+    let auditResult;
+    try {
+      auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    } catch {
+      auditResult = { operationId: audit.operationId, auditComplete: false };
+    }
+    return { ...binding, ...auditResult };
+  } catch (error) {
+    if (audit !== null && binding === null) {
+      finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+    }
+    throw error;
   } finally {
     releaseLock();
   }
 }
 
-export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }) {
+export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot, launchctlRunner = runLaunchctl }) {
+  if (typeof launchctlRunner !== "function") throw new Error("launchctl-runner-invalid");
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  let audit = null;
+  let enabled = false;
   try {
     const status = deploymentStatusV3({ home, deploymentRoot: overrideRoot });
     if (!status.deployed) throw new Error("deployment-pre-automation-invalid");
@@ -1688,6 +1884,12 @@ export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot })
       const stats = lstatSync(paths.launchAgentPath);
       if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("launch-agent-path-unsafe");
     }
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "automation-enable",
+      trigger: "manual",
+      targetId: null,
+    });
     const plist = renderLaunchAgentPlist({
       home,
       deploymentRoot: paths.deploymentRoot,
@@ -1695,36 +1897,61 @@ export function enableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot })
       qemuPath: state.qemuPath,
     });
     atomicWrite(paths.launchAgentPath, plist);
-    runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
+    launchctlRunner(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     state.automation = { label: LAUNCH_AGENT_LABEL, plistSha256: sha256(paths.launchAgentPath), intervalSeconds: 3600 };
     writeOwnedJson(paths.statePath, state);
-    const bootstrap = runLaunchctl(paths, ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath]);
+    const bootstrap = launchctlRunner(paths, ["bootstrap", `gui/${process.getuid()}`, paths.launchAgentPath]);
     if (!resultPassed(bootstrap)) {
       delete state.automation;
       writeOwnedJson(paths.statePath, state);
       rmSync(paths.launchAgentPath);
       throw new Error("launch-agent-bootstrap-refused");
     }
-    const loaded = runLaunchctl(paths, ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
+    const loaded = launchctlRunner(paths, ["print", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     if (!resultPassed(loaded)) {
-      runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
+      launchctlRunner(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
       delete state.automation;
       writeOwnedJson(paths.statePath, state);
       rmSync(paths.launchAgentPath);
       throw new Error("launch-agent-status-refused");
     }
-    return { enabled: true, loaded: true, intervalSeconds: 3600 };
+    enabled = true;
+    let auditResult;
+    try {
+      auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    } catch {
+      auditResult = { operationId: audit.operationId, auditComplete: false };
+    }
+    return { enabled: true, loaded: true, intervalSeconds: 3600, ...auditResult };
+  } catch (error) {
+    if (audit !== null && !enabled) {
+      try {
+        finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+      } catch {
+        // The incomplete start record remains visible when refusal-result persistence fails.
+      }
+    }
+    throw error;
   } finally {
     releaseLock();
   }
 }
 
-export function disableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }) {
+export function disableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot, launchctlRunner = runLaunchctl }) {
+  if (typeof launchctlRunner !== "function") throw new Error("launchctl-runner-invalid");
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
+  let audit = null;
+  let disabled = false;
   try {
     const { state } = stateAndCurrent(paths);
-    runLaunchctl(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
+    audit = beginAuditOperation({
+      deploymentRoot: paths.deploymentRoot,
+      action: "automation-disable",
+      trigger: "manual",
+      targetId: null,
+    });
+    launchctlRunner(paths, ["bootout", `gui/${process.getuid()}/${LAUNCH_AGENT_LABEL}`]);
     if (existsSync(paths.launchAgentPath)) {
       const stats = lstatSync(paths.launchAgentPath);
       if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("launch-agent-path-unsafe");
@@ -1732,7 +1959,23 @@ export function disableAutomaticUpdatesV3({ home, deploymentRoot: overrideRoot }
     }
     delete state.automation;
     writeOwnedJson(paths.statePath, state);
-    return { enabled: false, loaded: false };
+    disabled = true;
+    let auditResult;
+    try {
+      auditResult = finishReleaseAudit(paths, audit.operationId, "succeeded", null);
+    } catch {
+      auditResult = { operationId: audit.operationId, auditComplete: false };
+    }
+    return { enabled: false, loaded: false, ...auditResult };
+  } catch (error) {
+    if (audit !== null && !disabled) {
+      try {
+        finishReleaseAudit(paths, audit.operationId, "refused", stableAuditError(error));
+      } catch {
+        // The incomplete start record remains visible when refusal-result persistence fails.
+      }
+    }
+    throw error;
   } finally {
     releaseLock();
   }
@@ -1754,7 +1997,7 @@ async function fetchLatestRelease(policy) {
 
 function resolveRegistryIntegrity(state, policy, packageName, version, environment) {
   const result = runCommand(
-    state.npmCommand,
+    resolvedNpmCommand(paths, state),
     registryViewArguments(policy, packageName, version),
     { env: environment, timeout: 30_000 },
   );
@@ -1776,7 +2019,7 @@ function installCandidatePackage(state, policy, candidateRoot, release, environm
     dependencies: { [release.packageName]: release.version },
   }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   const result = runCommand(
-    state.npmCommand,
+    resolvedNpmCommand(paths, state),
     candidateInstallArguments(policy, candidateRoot, release),
     { env: environment, timeout: 180_000 },
   );
@@ -1885,7 +2128,14 @@ function recoverPendingReleaseTransaction(paths) {
   return { recovered: true, auditComplete: true, ...recovered };
 }
 
-export async function updateV3({ home, deploymentRoot: overrideRoot, force = false, updateExtensions = false }) {
+export async function updateV3({
+  home,
+  deploymentRoot: overrideRoot,
+  force = false,
+  updateExtensions = false,
+  trigger = "manual",
+}) {
+  if (trigger !== "manual" && trigger !== "automatic") throw new Error("update-trigger-invalid");
   const paths = deploymentPaths(home, overrideRoot);
   const releaseLock = acquireUpdateLock(paths.deploymentRoot);
   let state;
@@ -1945,7 +2195,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
       if (!qualifyRelease({
         deploymentRoot: paths.deploymentRoot,
         releaseRoot: currentRoot,
-        nodePath: state.nodePath,
+        nodePath: resolvedRuntimeNodePath(paths, state),
         launcherPath: paths.launcherPath,
         environment,
       })) throw new Error("current-release-requalification-refused");
@@ -1977,7 +2227,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
     audit = beginAuditOperation({
       deploymentRoot: paths.deploymentRoot,
       action: "release-update",
-      trigger: "manual",
+      trigger,
       targetId: releaseId,
     });
     beginReleaseTransaction({
@@ -2000,7 +2250,7 @@ export async function updateV3({ home, deploymentRoot: overrideRoot, force = fal
           run: async (path) => qualifyRelease({
             deploymentRoot: paths.deploymentRoot,
             releaseRoot: path,
-            nodePath: state.nodePath,
+            nodePath: resolvedRuntimeNodePath(paths, state),
             launcherPath: paths.launcherPath,
             environment,
           }),
@@ -2183,7 +2433,7 @@ function delegateToCurrentPi(paths, args) {
   const releaseRoot = currentReleaseRoot(paths.deploymentRoot);
   if (!verifyRelease(releaseRoot)) throw new Error("current-release-integrity-refused");
   const { state } = stateAndCurrent(paths);
-  const result = run(state.nodePath, [join(packageRoot(releaseRoot), "dist", "cli.js"), ...args], {
+  const result = run(resolvedRuntimeNodePath(paths, state), [join(packageRoot(releaseRoot), "dist", "cli.js"), ...args], {
     inherit: true,
     interactive: true,
     timeout: 180_000,
@@ -2191,7 +2441,7 @@ function delegateToCurrentPi(paths, args) {
   return commandStatus(result);
 }
 
-export async function routePiRequest({ home, deploymentRoot: overrideRoot, args }) {
+export async function routePiRequest({ home, deploymentRoot: overrideRoot, args, trigger = "manual" }) {
   const paths = deploymentPaths(home, overrideRoot);
   const target = classifyUpdateRequest(args);
   if (target.kind === "refuse") throw new Error("update-target-refused");
@@ -2201,6 +2451,7 @@ export async function routePiRequest({ home, deploymentRoot: overrideRoot, args 
     deploymentRoot: overrideRoot,
     force: target.force,
     updateExtensions: target.updateExtensions,
+    trigger,
   });
   return { exitCode: 0, result };
 }

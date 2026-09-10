@@ -142,6 +142,9 @@ npm run eval:status
 # Vérifie le déploiement transactionnel, la release active et ses empreintes
 npm run deployment:status
 
+# Mesure 20 vérifications complètes de la release active
+npm run benchmark:release-integrity
+
 # Met à jour Pi via candidate isolée + gates Gondolin
 pi update
 
@@ -177,9 +180,11 @@ pi update
 npm run transactional:automation:enable
 ```
 
-Depuis le profil v3, `pi update` installe la version cible dans une candidate privée, vérifie l’intégrité npm et les licences, rejoue les gates CLI/RPC/Gondolin, puis bascule `current` atomiquement. `previous` reste disponible pour `npm run deployment:rollback`. Une candidate incompatible reste bloquée sans modifier la release active ; `pi update --force` permet une requalification explicite après évolution du contrôleur. Le runtime déployé est copié et manifesté : le checkout source peut être retiré sans casser Pi.
+Depuis le profil v3, `pi update` installe la version cible dans une candidate privée, vérifie l’intégrité npm et les licences, rejoue les gates CLI/RPC/Gondolin, puis bascule `current` atomiquement. `previous` reste disponible pour `npm run deployment:rollback`. Une candidate incompatible reste bloquée sans modifier la release active ; `pi update --force` permet une requalification explicite après évolution du contrôleur. Le runtime déployé est copié et manifesté : le checkout source peut être retiré sans casser Pi. La révision 2 du contrôleur stocke `node-current/node` comme chemin relatif et rafraîchit les anciens déploiements liés sans remplacer leur binding ni leurs releases.
 
-L’agent utilisateur `launchd` optionnel exécute le même contrôle au chargement puis toutes les heures. Il ne promeut que les versions compatibles et persiste uniquement l’identifiant agrégé d’une release bloquée. Voir [ADR-0001](./docs/adr-0001-transactional-pi-updates.md).
+Chaque fichier régulier d’une release est couvert par son manifeste ; les symlinks et fichiers spéciaux sont refusés. Cette protection détecte la corruption et la dérive accidentelle, mais pas un processus malveillant disposant déjà des droits du même utilisateur et capable de réécrire simultanément fichiers et manifeste.
+
+L’agent utilisateur `launchd` optionnel exécute le même contrôle au chargement puis toutes les heures. Il ne promeut que les versions compatibles, marque explicitement le déclencheur `automatic` et neutralise stdout/stderr. Son plist privé contient nécessairement des chemins absolus et `HOME` : c’est l’exception d’intégration macOS, jamais copiée dans l’audit. Les opérations de release, binding, adoption et automation gardent jusqu’à 256 preuves locales terminées ; une preuve incomplète n’est jamais supprimée automatiquement. Voir [ADR-0001](./docs/adr-0001-transactional-pi-updates.md) et [l’analyse de souveraineté](./docs/sovereignty.md).
 
 ## Activation globale du package complet
 

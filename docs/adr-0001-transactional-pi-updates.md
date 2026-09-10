@@ -87,3 +87,48 @@ the controller, wrappers, deployment state, and optional launchd plist. Recovery
 restores fixed-name backups or finishes binding activation and post-activation smoke.
 The Pi release directories and the `current`/`previous` release links are outside this
 replacement set and remain unchanged.
+
+## Amendment — controller revision 2, complete manifests, and local audit (2026-09-09)
+
+Revision 2 persists the exact relative runtime path `node-current/node`; the Node member
+of `npmCommand` has the same value. Consumers accept no alternative and resolve it under
+the validated deployment root. Revision-1 absolute state is accepted only as migration
+input. Stable wrappers resolve symlinks from `$0` and derive the deployment root from
+their own physical directory, so they contain no user-home path. The private launchd
+plist remains the deliberate macOS exception because launchd requires absolute program
+and environment paths.
+
+`installV3` now refreshes already-bound revision-1 deployments and revision-2 deployments
+whose manifested controller sources differ from the checkout. It uses the adoption
+journal to replace the controller, controller manifest, wrappers, state, and optional
+launchd plist while preserving the qualified binding and both release links. Recovery is
+tested by terminating a child process at `prepared`, `artifacts-installed`,
+`binding-active`, and `launchd-loaded`, including dead-lock reclamation.
+
+Release manifests cover every regular file except `critical.sha256`. npm `.bin` links,
+all other symlinks, special files, duplicate paths, and control characters are refused.
+An existing partial manifest is upgraded only after it still verifies and the active
+release passes the compatibility qualification. Atomic rename followed by directory
+`fsync` makes this single-file trust transition crash-safe. This detects corruption and
+unintended drift, not a malicious process already holding the local user's authority.
+
+Release promotion and rollback use a private journal with durable phases `prepared`,
+`links-active`, `qualified`, and `state-active`. Each user-initiated mutation also writes
+a bounded local audit start before mutation and an immutable result after it. Runtime
+adoption journals carry the audit operation UUID so restart recovery can close the same
+evidence with outcome `recovered`. If result persistence fails after an applied atomic
+mutation, the command reports the real operational success with `auditComplete: false`;
+read-only status exposes the incomplete evidence. Completed retention is 256 and never
+automatically removes incomplete operations.
+
+The launchd environment marks scheduled checks as `automatic`; direct controller calls
+pass `manual`. This marker records provenance and is not an authorization boundary.
+Administrative child processes receive only the explicit recovery allowlist and required
+per-gate variables.
+
+Outbound metadata and package sources are loaded from the manifest-covered supply-chain
+policy. The default `upstream-exception` profile is explicitly `not-sovereign`; it uses
+pi.dev and npm over bounded HTTPS contracts. A reviewed EU mirror can implement the same
+static descriptor and npm-compatible protocol without controller changes. The Gondolin
+lockfile pins the reviewed MIT `undici` override and a zero-finding production dependency
+audit is a release gate.

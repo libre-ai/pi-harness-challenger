@@ -20,9 +20,12 @@ import {
   ADOPTION_JOURNAL_VERSION,
   advanceRuntimeAdoption,
   beginRuntimeAdoption,
+  inspectRuntimeAdoption,
   recoverRuntimeAdoption,
   removeAbandonedAdoptionPreparations,
 } from "../experiments/gondolin/runtime-adoption.mjs";
+
+const TEST_OPERATION_ID = "11111111-1111-4111-8111-111111111111";
 
 function makeWritable(path) {
   if (!existsSync(path)) return;
@@ -61,16 +64,22 @@ function adoptionArtifacts() {
 test("adoption journal persists an exact private non-PII schema", () => {
   const { root, cleanup } = fixture();
   try {
-    const journal = beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts() });
+    const journal = beginRuntimeAdoption({
+      deploymentRoot: root,
+      artifacts: adoptionArtifacts(),
+      operationId: TEST_OPERATION_ID,
+    });
     assert.deepEqual(journal, {
-      version: 1,
+      version: 2,
       phase: "prepared",
       artifacts: adoptionArtifacts(),
+      operationId: TEST_OPERATION_ID,
     });
-    assert.equal(ADOPTION_JOURNAL_VERSION, 1);
+    assert.equal(ADOPTION_JOURNAL_VERSION, 2);
     assert.equal(lstatSync(join(root, "adoption")).mode & 0o077, 0);
     assert.equal(lstatSync(join(root, "adoption", "journal.json")).mode & 0o077, 0);
     assert.deepEqual(JSON.parse(readFileSync(join(root, "adoption", "journal.json"), "utf8")), journal);
+    assert.deepEqual(inspectRuntimeAdoption({ deploymentRoot: root }), journal);
 
     assert.equal(
       advanceRuntimeAdoption({ deploymentRoot: root, expectedPhase: "prepared", nextPhase: "artifacts-installed" }).phase,
@@ -79,6 +88,27 @@ test("adoption journal persists an exact private non-PII schema", () => {
     assert.throws(
       () => advanceRuntimeAdoption({ deploymentRoot: root, expectedPhase: "prepared", nextPhase: "binding-active" }),
       /adoption-journal-phase-mismatch/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("adoption inspection accepts legacy version 1 only as recovery input", () => {
+  const { root, cleanup } = fixture();
+  try {
+    assert.equal(inspectRuntimeAdoption({ deploymentRoot: root }), null);
+    mkdirSync(join(root, "adoption"), { mode: 0o700 });
+    const legacyJournal = { version: 1, phase: "prepared", artifacts: adoptionArtifacts() };
+    writeFileSync(
+      join(root, "adoption", "journal.json"),
+      `${JSON.stringify(legacyJournal)}\n`,
+      { mode: 0o600 },
+    );
+    assert.deepEqual(inspectRuntimeAdoption({ deploymentRoot: root }), legacyJournal);
+    assert.throws(
+      () => beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts(), operationId: "invalid" }),
+      /adoption-journal-operation-id-invalid/,
     );
   } finally {
     cleanup();
@@ -102,6 +132,7 @@ test("a crash immediately before publication never exposes an empty adoption jou
     beginRuntimeAdoption({
       deploymentRoot: process.argv[1],
       artifacts: ${JSON.stringify(adoptionArtifacts())},
+      operationId: ${JSON.stringify(TEST_OPERATION_ID)},
     });
   `;
 
@@ -167,7 +198,7 @@ test("adoption journal recovery deterministically rolls back or completes", asyn
     await t.test(phase, async () => {
       const { root, cleanup } = fixture();
       try {
-        beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts() });
+        beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts(), operationId: TEST_OPERATION_ID });
         const phases = ["artifacts-installed", "binding-active", "launchd-loaded"];
         let current = "prepared";
         for (const next of phases) {
@@ -201,7 +232,7 @@ test("adoption journal recovery restores backups when installed artifacts do not
     await t.test(phase, async () => {
       const { root, cleanup } = fixture();
       try {
-        beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts() });
+        beginRuntimeAdoption({ deploymentRoot: root, artifacts: adoptionArtifacts(), operationId: TEST_OPERATION_ID });
         const phases = ["artifacts-installed", "binding-active", "launchd-loaded"];
         let current = "prepared";
         for (const next of phases) {
@@ -231,12 +262,19 @@ test("adoption journal recovery restores backups when installed artifacts do not
 test("adoption journal fails closed before callbacks for unsafe state", async (t) => {
   const cases = [
     ["unknown version", (root) => {
-      const journal = { version: 2, phase: "prepared", artifacts: adoptionArtifacts() };
+      const journal = { version: 3, phase: "prepared", artifacts: adoptionArtifacts(), operationId: TEST_OPERATION_ID };
       writeFileSync(join(root, "adoption", "journal.json"), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
     }],
     ["unknown phase", (root) => {
       const journal = { version: 1, phase: "unknown", artifacts: adoptionArtifacts() };
       writeFileSync(join(root, "adoption", "journal.json"), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
+    }],
+    ["invalid operation id", (root) => {
+      const journal = { version: 2, phase: "prepared", artifacts: adoptionArtifacts(), operationId: "invalid" };
+      writeFileSync(join(root, "adoption", "journal.json"), `${JSON.stringify(journal)}\n`, { mode: 0o600 });
+    }],
+    ["invalid JSON", (root) => {
+      writeFileSync(join(root, "adoption", "journal.json"), "{\n", { mode: 0o600 });
     }],
     ["invalid digest", (root) => {
       const artifacts = adoptionArtifacts();

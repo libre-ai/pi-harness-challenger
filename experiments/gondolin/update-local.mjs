@@ -20,6 +20,8 @@ const home = process.env.HOME ?? homedir();
 const deploymentRoot = process.env.PI_GONDOLIN_DEPLOYMENT_ROOT;
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(scriptDirectory, "../..");
+const updateTrigger = process.env.PI_GONDOLIN_UPDATE_TRIGGER === "automatic" ? "automatic" : "manual";
+const runtimeTrigger = process.env.PI_GONDOLIN_UPDATE_TRIGGER === "recovery" ? "recovery" : "manual";
 
 if (!isAbsolute(home) || home.includes("\0") || home.includes("\n")) {
   process.stderr.write("gondolin-transactional-update-refused:home-invalid\n");
@@ -41,12 +43,14 @@ async function main() {
     return rollbackV3({ home, deploymentRoot });
   }
   if (action === "runtime-repin" && actionArgs.length === 0) {
-    const binding = await runtimeRepinV3({ home, deploymentRoot });
+    const binding = await runtimeRepinV3({ home, deploymentRoot, trigger: runtimeTrigger });
     return {
       repaired: true,
       bindingId: binding.bindingId,
       nodeVersion: binding.nodeVersion,
       qualifiedAt: binding.qualifiedAt,
+      operationId: binding.operationId,
+      auditComplete: binding.auditComplete,
     };
   }
   if (action === "automation-enable" && actionArgs.length === 0) {
@@ -56,10 +60,10 @@ async function main() {
     return disableAutomaticUpdatesV3({ home, deploymentRoot });
   }
   if (action === "update" && actionArgs.every((argument) => argument === "--force")) {
-    return updateV3({ home, deploymentRoot, force: actionArgs.includes("--force") });
+    return updateV3({ home, deploymentRoot, force: actionArgs.includes("--force"), trigger: updateTrigger });
   }
   if (action === "route" && actionArgs[0] === "update") {
-    const routed = await routePiRequest({ home, deploymentRoot, args: actionArgs });
+    const routed = await routePiRequest({ home, deploymentRoot, args: actionArgs, trigger: updateTrigger });
     if (routed.exitCode !== 0) process.exitCode = routed.exitCode;
     return routed.result;
   }

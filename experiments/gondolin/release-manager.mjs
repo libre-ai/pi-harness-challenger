@@ -404,6 +404,53 @@ export function listReleaseManifestFiles(releaseRoot) {
   return files.sort((left, right) => left.localeCompare(right));
 }
 
+export function removeNpmBinDirectories(releaseRoot) {
+  const rootStats = lstatSync(releaseRoot);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !isOwned(rootStats)) {
+    throw new Error("release-tree-root-unsafe");
+  }
+  const binDirectories = [];
+
+  function visit(directory) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const stats = lstatSync(path);
+      if (entry.name === ".bin") {
+        if (!stats.isDirectory() || stats.isSymbolicLink() || !isOwned(stats)) {
+          throw new Error("release-bin-directory-unsafe");
+        }
+        for (const binEntry of readdirSync(path)) {
+          const binStats = lstatSync(join(path, binEntry));
+          if (!binStats.isSymbolicLink() || !isOwned(binStats)) {
+            throw new Error("release-bin-entry-unsafe");
+          }
+        }
+        binDirectories.push(path);
+      } else if (stats.isDirectory() && !stats.isSymbolicLink() && isOwned(stats)) {
+        visit(path);
+      } else if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) {
+        throw new Error("release-tree-entry-unsafe");
+      }
+    }
+  }
+
+  visit(releaseRoot);
+  const changedDirectories = new Set();
+  for (const path of binDirectories) {
+    rmSync(path, { recursive: true });
+    changedDirectories.add(dirname(path));
+  }
+  for (const directory of changedDirectories) {
+    const directoryDescriptor = openSync(directory, "r");
+    try {
+      fsyncSync(directoryDescriptor);
+    } finally {
+      closeSync(directoryDescriptor);
+    }
+  }
+  return binDirectories.length;
+}
+
 export function verifyCriticalManifest(releaseRoot, manifestPath) {
   try {
     const manifestStats = lstatSync(manifestPath);
@@ -458,6 +505,7 @@ export async function upgradeReleaseManifest({
     throw new Error("release-manifest-upgrade-qualification-refused");
   }
 
+  removeNpmBinDirectories(releaseRoot);
   const root = realpathSync(releaseRoot);
   const relativeManifestPath = relative(root, realpathSync(manifestPath)).split(sep).join("/");
   const manifestFiles = listReleaseManifestFiles(root)

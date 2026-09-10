@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-export const ADOPTION_JOURNAL_VERSION = 1;
+export const ADOPTION_JOURNAL_VERSION = 2;
 
 const ARTIFACT_KEYS = ["controller", "pi", "pi-gondolin-rpc", "deployment.json", "launchd"];
 const PHASES = new Set(["prepared", "artifacts-installed", "binding-active", "launchd-loaded", "complete"]);
@@ -25,6 +25,7 @@ const NEXT_PHASE = new Map([
   ["launchd-loaded", "complete"],
 ]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ADOPTION_PREPARATION_PATTERN = /^\.adoption-prepare-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isOwned(stats) {
@@ -69,8 +70,15 @@ function validateArtifacts(artifacts) {
 }
 
 function validateJournal(journal) {
-  requireExactKeys(journal, ["version", "phase", "artifacts"], "adoption-journal-schema-invalid");
-  if (journal.version !== ADOPTION_JOURNAL_VERSION) throw new Error("adoption-journal-version-invalid");
+  if (journal?.version === 1) {
+    requireExactKeys(journal, ["version", "phase", "artifacts"], "adoption-journal-schema-invalid");
+  } else {
+    requireExactKeys(journal, ["version", "phase", "artifacts", "operationId"], "adoption-journal-schema-invalid");
+    if (journal.version !== ADOPTION_JOURNAL_VERSION) throw new Error("adoption-journal-version-invalid");
+    if (typeof journal.operationId !== "string" || !UUID_PATTERN.test(journal.operationId)) {
+      throw new Error("adoption-journal-operation-id-invalid");
+    }
+  }
   if (!PHASES.has(journal.phase)) throw new Error("adoption-journal-phase-invalid");
   validateArtifacts(journal.artifacts);
   return journal;
@@ -170,9 +178,12 @@ export function removeAbandonedAdoptionPreparations({ deploymentRoot }) {
   return removed;
 }
 
-export function beginRuntimeAdoption({ deploymentRoot, artifacts }) {
+export function beginRuntimeAdoption({ deploymentRoot, artifacts, operationId }) {
   requirePrivateDirectory(deploymentRoot, "adoption-deployment-directory-unsafe");
   validateArtifacts(artifacts);
+  if (typeof operationId !== "string" || !UUID_PATTERN.test(operationId)) {
+    throw new Error("adoption-journal-operation-id-invalid");
+  }
   const { adoptionRoot } = adoptionPaths(deploymentRoot);
   if (pathExists(adoptionRoot)) throw new Error("adoption-journal-already-exists");
   removeAbandonedAdoptionPreparations({ deploymentRoot });
@@ -184,11 +195,19 @@ export function beginRuntimeAdoption({ deploymentRoot, artifacts }) {
     version: ADOPTION_JOURNAL_VERSION,
     phase: "prepared",
     artifacts,
+    operationId,
   };
   durableWriteJournal(preparationRoot, join(preparationRoot, "journal.json"), journal);
   renameSync(preparationRoot, adoptionRoot);
   fsyncDirectory(deploymentRoot);
   return journal;
+}
+
+export function inspectRuntimeAdoption({ deploymentRoot }) {
+  const { adoptionRoot } = adoptionPaths(deploymentRoot);
+  removeAbandonedAdoptionPreparations({ deploymentRoot });
+  if (!pathExists(adoptionRoot)) return null;
+  return readJournal(deploymentRoot);
 }
 
 export function advanceRuntimeAdoption({ deploymentRoot, expectedPhase, nextPhase }) {

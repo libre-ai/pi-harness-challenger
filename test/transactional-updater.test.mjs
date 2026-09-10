@@ -27,11 +27,14 @@ import {
   auditPiPackageLicenses,
   buildDeploymentRuntimeState,
   deploymentStaticStatusV3,
+  disableAutomaticUpdatesV3,
+  enableAutomaticUpdatesV3,
   installV3,
   qualificationEnvironment,
   renderLaunchAgentPlist,
   renderStableLauncherWrapper,
   renderStablePiWrapper,
+  resolveStoredNodePath,
   runtimeRepinV3,
   verifyCandidatePackage,
 } from "../experiments/gondolin/deployment-controller.mjs";
@@ -51,12 +54,14 @@ import {
   parseLatestRelease,
   promoteCandidate,
   releaseIdFor,
+  removeNpmBinDirectories,
   rollbackRelease,
   upgradeReleaseManifest,
   verifyCriticalManifest,
   verifyCompleteReleaseManifest,
 } from "../experiments/gondolin/release-manager.mjs";
 import {
+  auditStatus,
   beginAuditOperation,
   completeAuditOperation,
   inspectAuditOperation,
@@ -264,7 +269,11 @@ async function runtimeLifecycleFixture() {
   for (const file of controllerFiles) {
     cpSync(join(sourceRoot, "experiments", "gondolin", file), join(controllerRoot, file));
   }
-  writeFileSync(join(runtimeExperimentRoot, "safe-rpc-launcher.mjs"), "process.exit(64);\n", { mode: 0o600 });
+  writeFileSync(
+    join(runtimeExperimentRoot, "safe-rpc-launcher.mjs"),
+    "process.stderr.write('gondolin-rpc-launcher-refused\\n'); process.exit(64);\n",
+    { mode: 0o600 },
+  );
   writeFileSync(join(runtimeExperimentRoot, "deployed-rpc-e2e.mjs"), "process.exit(0);\n", { mode: 0o600 });
   writeFileSync(join(runtimeExperimentRoot, "budget-test.mjs"), "process.exit(0);\n", { mode: 0o600 });
   writeFileSync(
@@ -478,7 +487,8 @@ test("adopts healthy and broken direct-path v3 deployments without changing rele
         assert.equal(activationCount, 1);
         assert.equal(events[0].environment.OPENAI_API_KEY, undefined);
         assert.equal(state.runtimeBindingVersion, 1);
-        assert.equal(state.nodePath, join(fixture.root, "node-current", "node"));
+        assert.equal(state.controllerRevision, 2);
+        assert.equal(state.nodePath, "node-current/node");
         assert.equal(result.staticIntegrityPassed, true);
         assert.equal(readlinkSync(join(fixture.root, "current")), before.current);
         assert.equal(readlinkSync(join(fixture.root, "previous")), before.previous);
@@ -596,7 +606,177 @@ test("adoption interruption recovery finishes a binding moved before node-curren
   }
 });
 
-test("fresh v3 runtime binding uses one stable deployment-owned Node path", async () => {
+test("install refreshes a revision-1 bound controller without replacing binding or releases", async () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const fixture = staticDeploymentFixture({
+    canonicalNodePath: realpathSync(process.execPath),
+    nodeVersion: process.version,
+  });
+  const currentTarget = readlinkSync(join(fixture.root, "current"));
+  const previousTarget = readlinkSync(join(fixture.root, "previous"));
+  const bindingTarget = readlinkSync(join(fixture.root, "node-current"));
+  const activeRelease = realpathSync(join(fixture.root, "current"));
+  writeFileSync(join(activeRelease, "internal.js"), "export const value = 1;\n", { mode: 0o600 });
+  assert.equal(verifyCriticalManifest(activeRelease, join(activeRelease, "critical.sha256")), true);
+  assert.equal(verifyCompleteReleaseManifest(activeRelease, join(activeRelease, "critical.sha256")), false);
+
+  try {
+    const status = await installV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      qualificationGate: async ({ integrityVerifier, releaseRoot }) => integrityVerifier(
+        releaseRoot,
+        join(releaseRoot, "critical.sha256"),
+      ),
+      postActivationGate: async () => true,
+    });
+    const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+    assert.equal(state.controllerRevision, 2);
+    assert.equal(state.nodePath, "node-current/node");
+    assert.equal(state.npmCommand[0], "node-current/node");
+    assert.doesNotMatch(JSON.stringify(state), new RegExp(fixture.home.replaceAll("/", "\\/")));
+    assert.equal(readlinkSync(join(fixture.root, "current")), currentTarget);
+    assert.equal(readlinkSync(join(fixture.root, "previous")), previousTarget);
+    assert.equal(readlinkSync(join(fixture.root, "node-current")), bindingTarget);
+    assert.equal(verifyCompleteReleaseManifest(activeRelease, join(activeRelease, "critical.sha256")), true);
+    assert.equal(status.staticIntegrityPassed, true);
+    assert.equal(status.auditComplete, true);
+    assert.match(status.operationId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(auditStatus({ deploymentRoot: fixture.root }), {
+      completed: 1,
+      incomplete: 0,
+      incompleteOperationIds: [],
+    });
+    assert.deepEqual(inspectAuditOperation({
+      deploymentRoot: fixture.root,
+      operationId: status.operationId,
+    }), {
+      operationId: status.operationId,
+      action: "runtime-adoption",
+      trigger: "manual",
+      targetId: null,
+      complete: true,
+      outcome: "succeeded",
+      errorCode: null,
+    });
+    const auditText = readdirSync(join(fixture.root, "audit", "operations"))
+      .flatMap((operationId) => readdirSync(join(fixture.root, "audit", "operations", operationId))
+        .map((file) => readFileSync(join(fixture.root, "audit", "operations", operationId, file), "utf8")))
+      .join("\n");
+    assert.doesNotMatch(auditText, new RegExp(fixture.home.replaceAll("/", "\\/")));
+    assert.equal(
+      readFileSync(join(fixture.root, "controller", "deployment-controller.mjs"), "utf8"),
+      readFileSync(join(projectRoot, "experiments", "gondolin", "deployment-controller.mjs"), "utf8"),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("install refreshes stale controller sources within revision 2", async () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const fixture = staticDeploymentFixture({
+    canonicalNodePath: realpathSync(process.execPath),
+    nodeVersion: process.version,
+  });
+  try {
+    const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+    state.controllerRevision = 2;
+    state.nodePath = "node-current/node";
+    state.npmCommand[0] = "node-current/node";
+    writeFileSync(fixture.paths.statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+
+    const status = await installV3({
+      home: fixture.home,
+      projectRoot,
+      deploymentRoot: fixture.root,
+      qualificationGate: async () => true,
+      postActivationGate: async () => true,
+    });
+    assert.equal(status.auditComplete, true);
+    assert.equal(
+      readFileSync(join(fixture.root, "controller", "release-manager.mjs"), "utf8"),
+      readFileSync(join(projectRoot, "experiments", "gondolin", "release-manager.mjs"), "utf8"),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("revision-1 controller refresh recovers every durable phase with the same binding and release links", async (t) => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const controllerUrl = new URL("../experiments/gondolin/deployment-controller.mjs", import.meta.url).href;
+  for (const phase of ["prepared", "artifacts-installed", "binding-active", "launchd-loaded"]) {
+    await t.test(phase, async () => {
+      const fixture = staticDeploymentFixture({
+        canonicalNodePath: realpathSync(process.execPath),
+        nodeVersion: process.version,
+      });
+      const expected = {
+        current: readlinkSync(join(fixture.root, "current")),
+        previous: readlinkSync(join(fixture.root, "previous")),
+        binding: readlinkSync(join(fixture.root, "node-current")),
+      };
+      try {
+        const childSource = `
+          const { adoptRuntimeBindingV3 } = await import(${JSON.stringify(controllerUrl)});
+          await adoptRuntimeBindingV3({
+            home: process.argv[1],
+            projectRoot: process.argv[2],
+            deploymentRoot: process.argv[3],
+            interruptionPoint: process.argv[4],
+            interruptionHandler: () => process.exit(86),
+            qualificationGate: async () => true,
+            postActivationGate: async () => true,
+          });
+        `;
+        const interrupted = spawnSync(
+          process.execPath,
+          ["--input-type=module", "--eval", childSource, fixture.home, projectRoot, fixture.root, phase],
+          { encoding: "utf8", timeout: 30_000 },
+        );
+        assert.equal(interrupted.status, 86, interrupted.stderr);
+        const status = await installV3({
+          home: fixture.home,
+          projectRoot,
+          deploymentRoot: fixture.root,
+          qualificationGate: async () => true,
+          postActivationGate: async () => true,
+        });
+        const state = JSON.parse(readFileSync(fixture.paths.statePath, "utf8"));
+        assert.equal(state.controllerRevision, 2);
+        assert.equal(state.nodePath, "node-current/node");
+        assert.equal(readlinkSync(join(fixture.root, "current")), expected.current);
+        assert.equal(readlinkSync(join(fixture.root, "previous")), expected.previous);
+        assert.equal(readlinkSync(join(fixture.root, "node-current")), expected.binding);
+        assert.equal(status.staticIntegrityPassed, true);
+        assert.equal(status.auditComplete, true);
+        if (phase === "prepared") {
+          assert.equal(inspectAuditOperation({
+            deploymentRoot: fixture.root,
+            operationId: status.operationId,
+          }).outcome, "succeeded");
+          assert.equal(inspectAuditOperation({
+            deploymentRoot: fixture.root,
+            operationId: status.recoveredOperationId,
+          }).outcome, "recovered");
+        } else {
+          assert.equal(inspectAuditOperation({
+            deploymentRoot: fixture.root,
+            operationId: status.operationId,
+          }).outcome, "recovered");
+        }
+        assert.equal(existsSync(join(fixture.root, "adoption")), false);
+        assert.equal(existsSync(join(fixture.root, "update.lock")), false);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("fresh v3 runtime binding persists one relative deployment-owned Node path", async () => {
   const temporary = temporaryRoot("pi-fresh-v3-binding-");
   const deploymentRoot = join(temporary.root, "deployment");
   mkdirSync(deploymentRoot, { mode: 0o700 });
@@ -613,10 +793,11 @@ test("fresh v3 runtime binding uses one stable deployment-owned Node path", asyn
     });
     const npmPath = "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js";
     const state = buildDeploymentRuntimeState({ deploymentRoot, canonicalNodePath, npmPath });
-    const expectedNodePath = join(deploymentRoot, "node-current", "node");
+    const expectedNodePath = "node-current/node";
 
     assert.deepEqual(state, {
       version: 3,
+      controllerRevision: 2,
       runtimeBindingVersion: 1,
       nodePath: expectedNodePath,
       nodeRecoveryPath: homebrewRecoveryAnchor(canonicalNodePath),
@@ -626,13 +807,18 @@ test("fresh v3 runtime binding uses one stable deployment-owned Node path", asyn
       inspectRuntimeBinding({ deploymentRoot, requireExecutable: true }).canonicalNodePath,
       canonicalNodePath,
     );
+    assert.equal(resolveStoredNodePath(deploymentRoot, state.nodePath), join(deploymentRoot, "node-current", "node"));
+    for (const refused of ["../node", "node-current/../node", "/tmp/node", "node-current/node\n"]) {
+      assert.throws(() => resolveStoredNodePath(deploymentRoot, refused), /deployment-runtime-path-invalid/);
+    }
     const wrapper = renderStablePiWrapper({
       deploymentRoot,
       nodePath: state.nodePath,
       nodeRecoveryPath: state.nodeRecoveryPath,
       launcherPath: join(deploymentRoot, "controller", "runtime", "safe-rpc-launcher.mjs"),
     });
-    assert.match(wrapper, new RegExp(expectedNodePath.replaceAll("/", "\\/")));
+    assert.match(wrapper, /NODE="\$ROOT\/node-current\/node"/);
+    assert.doesNotMatch(wrapper, new RegExp(deploymentRoot.replaceAll("/", "\\/")));
     assert.match(wrapper, new RegExp(state.nodeRecoveryPath.replaceAll("/", "\\/")));
   } finally {
     if (binding) chmodSync(binding.bindingRoot, 0o700);
@@ -695,6 +881,19 @@ test("runtime repin qualifies the current release before switching the binding",
     assert.equal(events[0].environment.OPENAI_API_KEY, undefined);
     assert.equal(events[0].environment.ANTHROPIC_API_KEY, undefined);
     assert.equal(result.canonicalNodePath, recoveryCanonicalNode);
+    assert.equal(result.auditComplete, true);
+    assert.deepEqual(inspectAuditOperation({
+      deploymentRoot: fixture.root,
+      operationId: result.operationId,
+    }), {
+      operationId: result.operationId,
+      action: "runtime-repin",
+      trigger: "manual",
+      targetId: null,
+      complete: true,
+      outcome: "succeeded",
+      errorCode: null,
+    });
     assert.equal(inspectRuntimeBinding({ deploymentRoot: fixture.root, requireExecutable: true }).active, true);
   } finally {
     fixture.cleanup();
@@ -879,6 +1078,11 @@ test("recovers after Homebrew removes the exact Node keg without changing Pi", a
       .join("\n");
     assert.doesNotMatch(auditText, /must-not-cross-recovery|private\/project-path|--version/);
     assert.doesNotMatch(auditText, new RegExp(fixture.home.replaceAll("/", "\\/")));
+    const repinAudit = readdirSync(join(fixture.root, "audit", "operations"))
+      .map((operationId) => inspectAuditOperation({ deploymentRoot: fixture.root, operationId }))
+      .find((operation) => operation.action === "runtime-repin");
+    assert.equal(repinAudit?.trigger, "recovery");
+    assert.equal(repinAudit?.outcome, "succeeded");
   } finally {
     if (existsSync(removedKeg)) renameSync(removedKeg, fixture.oldKeg);
     fixture.cleanup();
@@ -1013,6 +1217,7 @@ test("le job launchd appelle uniquement le contrôleur déployé avec des sortie
   assert.doesNotMatch(plist, /\/opt\/node\/bin\/node/);
   assert.doesNotMatch(plist, /update-local\.mjs/);
   assert.match(plist, /<string>update<\/string>/);
+  assert.match(plist, /<key>PI_GONDOLIN_UPDATE_TRIGGER<\/key>\s*<string>automatic<\/string>/);
   assert.match(plist, /\/dev\/null/);
   assert.match(plist, /test&amp;user/);
   assert.match(plist, /pi&lt;guard&gt;/);
@@ -1038,11 +1243,14 @@ test("les wrappers stables réparent seulement un binding Node cassé", () => {
   });
 
   for (const wrapper of [piWrapper, launcherWrapper]) {
-    assert.match(wrapper, /NODE='\/Users\/test\/deployment\/node-current\/node'/);
+    assert.match(wrapper, /while \[ -L "\$SCRIPT" \]/);
+    assert.match(wrapper, /NODE="\$ROOT\/node-current\/node"/);
     assert.match(wrapper, /RECOVERY_NODE='\/opt\/homebrew\/opt\/node\/bin\/node'/);
+    assert.doesNotMatch(wrapper, /\/Users\/test\/deployment/);
     assert.match(wrapper, /if \[ ! -x "\$NODE" \]; then/);
     assert.match(wrapper, /\/usr\/bin\/env -i/);
     assert.match(wrapper, /runtime-repin/);
+    assert.match(wrapper, /PI_GONDOLIN_UPDATE_TRIGGER='recovery'/);
     assert.doesNotMatch(wrapper, /Cellar\/node/);
     assert.doesNotMatch(wrapper, /OPENAI_API_KEY|ANTHROPIC_API_KEY/);
     assert.match(wrapper, /find \. ! -type d ! -type f/);
@@ -1063,6 +1271,52 @@ test("launchd réutilise le wrapper Pi stable sans pinner Node", () => {
   assert.match(plist, /<string>update<\/string>/);
   assert.doesNotMatch(plist, /Cellar\/node|opt\/node\/bin\/node|update-local\.mjs/);
   assert.doesNotMatch(plist, /StandardOutPath>[\s\S]*\.log/);
+});
+
+test("automation enable and disable persist complete local audit evidence", async () => {
+  const fixture = await runtimeLifecycleFixture();
+  const calls = [];
+  const launchctlRunner = (_paths, args) => {
+    calls.push(args);
+    return { status: 0, stdout: "", stderr: "", signal: null };
+  };
+  try {
+    const enabled = enableAutomaticUpdatesV3({
+      home: fixture.home,
+      deploymentRoot: fixture.root,
+      launchctlRunner,
+    });
+    assert.deepEqual(
+      inspectAuditOperation({ deploymentRoot: fixture.root, operationId: enabled.operationId }),
+      {
+        operationId: enabled.operationId,
+        action: "automation-enable",
+        trigger: "manual",
+        targetId: null,
+        complete: true,
+        outcome: "succeeded",
+        errorCode: null,
+      },
+    );
+    const launchAgentPath = join(fixture.home, "Library", "LaunchAgents", "dev.pi-gondolin.transactional-update.plist");
+    assert.match(readFileSync(launchAgentPath, "utf8"), /PI_GONDOLIN_UPDATE_TRIGGER/);
+
+    const disabled = disableAutomaticUpdatesV3({
+      home: fixture.home,
+      deploymentRoot: fixture.root,
+      launchctlRunner,
+    });
+    assert.equal(disabled.auditComplete, true);
+    assert.equal(inspectAuditOperation({
+      deploymentRoot: fixture.root,
+      operationId: disabled.operationId,
+    }).action, "automation-disable");
+    assert.equal(existsSync(launchAgentPath), false);
+    assert.equal(calls.some((args) => args[0] === "bootstrap"), true);
+    assert.equal(calls.some((args) => args[0] === "bootout"), true);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 test("l’audit des dépendances Pi refuse les licences interdites ou inconnues", () => {
@@ -1342,6 +1596,8 @@ test("un manifeste partiel n’est renforcé qu’après vérification et qualif
     mkdirSync(join(root, "dist"), { mode: 0o700 });
     writeFileSync(join(root, "dist", "cli.js"), 'import "./internal.js";\n', { mode: 0o600 });
     writeFileSync(join(root, "dist", "internal.js"), "export const value = 1;\n", { mode: 0o600 });
+    mkdirSync(join(root, "node_modules", ".bin"), { recursive: true, mode: 0o700 });
+    symlinkSync("../../dist/cli.js", join(root, "node_modules", ".bin", "pi"));
     const manifestPath = join(root, "critical.sha256");
     buildCriticalManifest(root, ["dist/cli.js"], manifestPath);
     const originalManifest = readFileSync(manifestPath, "utf8");
@@ -1357,8 +1613,35 @@ test("un manifeste partiel n’est renforcé qu’après vérification et qualif
       qualificationGate: async () => verifyCriticalManifest(root, manifestPath),
     }), true);
     assert.equal(verifyCompleteReleaseManifest(root, manifestPath), true);
+    assert.equal(existsSync(join(root, "node_modules", ".bin")), false);
     assert.match(readFileSync(manifestPath, "utf8"), /dist\/internal\.js/);
     assert.equal(await upgradeReleaseManifest({ releaseRoot: root, qualificationGate: async () => false }), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("npm bin cleanup refuses to delete an unexpected regular entry", () => {
+  const { root, cleanup } = temporaryRoot("pi-release-bin-cleanup-");
+  try {
+    mkdirSync(join(root, "node_modules", ".bin"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(root, "node_modules", ".bin", "unexpected"), "data\n", { mode: 0o600 });
+    assert.throws(() => removeNpmBinDirectories(root), /release-bin-entry-unsafe/);
+    assert.equal(readFileSync(join(root, "node_modules", ".bin", "unexpected"), "utf8"), "data\n");
+  } finally {
+    cleanup();
+  }
+});
+
+test("npm bin cleanup validates the complete tree before deleting anything", () => {
+  const { root, cleanup } = temporaryRoot("pi-release-bin-preflight-");
+  try {
+    mkdirSync(join(root, "a", ".bin"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(root, "target.js"), "export {};\n", { mode: 0o600 });
+    symlinkSync("../../target.js", join(root, "a", ".bin", "tool"));
+    symlinkSync("target.js", join(root, "z-unsafe-link"));
+    assert.throws(() => removeNpmBinDirectories(root), /release-tree-entry-unsafe/);
+    assert.equal(existsSync(join(root, "a", ".bin")), true);
   } finally {
     cleanup();
   }

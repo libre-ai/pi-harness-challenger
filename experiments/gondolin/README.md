@@ -29,6 +29,7 @@ Migration du profil v2 vers le contrôleur transactionnel :
 ```bash
 npm run transactional:install
 npm run transactional:status
+npm run benchmark:release-integrity
 pi update
 npm run transactional:automation:enable
 ```
@@ -51,8 +52,11 @@ PI_GONDOLIN_DEPLOYMENT_ROOT="$HOME/.local/share/pi-harness-challenger/gondolin-r
 ```
 
 `transactional:install` adopte aussi un v3 historique qui stocke directement un chemin
-`Cellar`, même si ce chemin a déjà disparu. Cette adoption est journalisée et reprend
-après interruption sans remplacer les releases ni leurs liens `current`/`previous`.
+`Cellar`, même si ce chemin a déjà disparu. Il rafraîchit également un contrôleur lié de
+révision 1 vers la révision 2, ainsi qu'une source déployée qui diffère du checkout au
+sein de la révision 2. Ces opérations sont journalisées et reprennent après une
+interruption sans remplacer les releases, leurs liens `current`/`previous` ni un binding
+déjà qualifié.
 
 La récupération automatique et `runtime-repin` sont volontairement étroits :
 
@@ -78,11 +82,12 @@ Exemple synthétique des champs runtime de `deployment.json` :
 ```json
 {
   "version": 3,
+  "controllerRevision": 2,
   "runtimeBindingVersion": 1,
-  "nodePath": "/opt/homebrew/var/pi-gondolin/v3/node-current/node",
+  "nodePath": "node-current/node",
   "nodeRecoveryPath": "/opt/homebrew/opt/node/bin/node",
   "npmCommand": [
-    "/opt/homebrew/var/pi-gondolin/v3/node-current/node",
+    "node-current/node",
     "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"
   ]
 }
@@ -103,6 +108,67 @@ Exemple synthétique de `node-bindings/<id>/binding.json` :
 
 Ces métadonnées conservent la preuve de qualification précédente sans PII. Le chemin
 canonique est un chemin système Homebrew synthétique, jamais un répertoire utilisateur.
+
+## Intégrité complète, transactions et audit
+
+Après installation, les répertoires npm `.bin` sont retirés : le contrôleur appelle des
+fichiers explicites et n'a pas besoin de ces symlinks. `critical.sha256` couvre ensuite
+tous les fichiers réguliers de la release, sauf lui-même. Un chemin ambigu, un retour
+chariot, un symlink ou un fichier spécial produit un refus stable. Les anciens manifestes
+partiels ne sont remplacés qu'après vérification de leur contenu historique et passage
+des gates complets ; le renommage atomique et le `fsync` du répertoire laissent toujours
+un ancien ou un nouveau manifeste valide après crash.
+
+Les promotions et rollbacks utilisent un journal de release privé. Les frontières
+durables sont `prepared`, `links-active`, `qualified` et `state-active`. L'adoption ou le
+refresh du contrôleur utilise `prepared`, `artifacts-installed`, `binding-active` et
+`launchd-loaded`. Au redémarrage, le contrôleur restaure l'état antérieur ou termine
+l'état qualifié ; il ne devine jamais un état intermédiaire.
+
+Les opérations `release-update`, `release-rollback`, `runtime-repin`, `runtime-adoption`,
+`automation-enable` et `automation-disable` écrivent sous
+`audit/operations/<uuid>/`. `started.json` est durable avant la mutation et
+`result.json` fixe l'issue. L'absence de résultat signale un crash. Seules les 256 plus
+récentes opérations terminées sont conservées ; les opérations incomplètes ne sont
+jamais élaguées. Supprimer le déploiement local est la procédure de suppression de ces
+preuves. Aucun prompt, secret, chemin Home ou chemin projet n'est admis dans ce schéma.
+
+Le repin lancé automatiquement par un wrapper porte le déclencheur d'audit `recovery` ;
+un repin opérateur reste `manual`. Le job launchd porte `automatic`. Ces valeurs décrivent
+la provenance et ne constituent pas une autorisation.
+
+Refus opérateur principaux :
+
+- `deployment-runtime-path-invalid` : le chemin persistant n'est pas exactement
+  `node-current/node` ou sort de la racine ;
+- `release-tree-entry-unsafe` : symlink, fichier spécial ou propriétaire inattendu ;
+- `release-manifest-upgrade-current-invalid` : l'ancien manifeste ne prouve plus son
+  périmètre historique ;
+- `release-manifest-upgrade-qualification-refused` : la transition de confiance vers le
+  manifeste complet n'a pas passé les gates ;
+- `release-transaction-audit-incomplete` : une mutation précédente doit d'abord faire
+  converger journal et preuve d'audit ;
+- `child-environment-*` : une commande administrative a reçu un environnement non
+  explicitement allowlisté.
+
+`npm run benchmark:release-integrity` exécute 20 vérifications de la release active et
+rapporte seulement `fileCount`, `runs`, `medianMs`, `p95Ms` et `maxMs`. Il n'existe pas de
+seuil CI dépendant de la machine. Mesure locale du 2026-09-10 sur la release 0.84.2 :
+13 186 fichiers, 20 runs, médiane 998,867 ms, p95 1 039,058 ms et maximum 1 062,543 ms.
+Ce coût d'environ une seconde est payé à chaque lancement afin de conserver la
+vérification complète prioritaire sur la performance. Les empreintes détectent la dérive
+et la corruption ; elles ne protègent pas contre un attaquant exécuté avec le même compte
+local, capable de réécrire à la fois l'arbre et son manifeste.
+
+## Dépendances et souveraineté
+
+Le lockfile fixe `undici` 6.28.1 (MIT) et `npm audit --omit=dev` doit rester sans finding.
+Le profil réseau par défaut est explicitement `upstream-exception` / `not-sovereign` :
+`pi.dev`, le registre npm et GitHub Actions n'apportent pas les preuves de résidence,
+d'opérateur et d'entité juridique UE requises. Une variante compatible peut conserver
+les mêmes protocoles JSON statique et npm via un descriptor Clever Cloud Cellar et un
+miroir GitLab Package Registry ou Harbor opérés dans l'UE. Voir
+[`docs/sovereignty.md`](../../docs/sovereignty.md).
 
 ## Exécution
 
