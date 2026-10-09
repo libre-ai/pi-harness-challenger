@@ -53,6 +53,7 @@
     "eval:sandbox:licenses": "node scripts/sandbox-license-audit.mjs",
     "eval:status": "node scripts/eval-status.mjs",
     "lint:comments": "node scripts/comment-hygiene.mjs",
-    "check": "npm run lint:comments && npm run test && npm run test:transactional:coverage && npm run test:runtime-lifecycle:coverage && npm run test:release-transaction:coverage && npm run test:operation-audit:coverage && npm run test:bounded-json:coverage && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
+    "lint:undeclared": "npx -y @biomejs/biome@2.5.15 lint --only=correctness/noUndeclaredVariables experiments extensions scripts",
+    "check": "npm run lint:comments && npm run lint:undeclared && npm run test && npm run test:transactional:coverage && npm run test:runtime-lifecycle:coverage && npm run test:release-transaction:coverage && npm run test:operation-audit:coverage && npm run test:bounded-json:coverage && npm run smoke && npm run smoke:skills && npm run smoke:budgets && npm run smoke:rpc && npm run deployment:status"
   }
 }

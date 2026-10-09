@@ -1995,7 +1995,7 @@ async function fetchLatestRelease(policy) {
   return readBoundedJsonResponse(response, { maxBytes: 128 * 1024 });
 }
 
-function resolveRegistryIntegrity(state, policy, packageName, version, environment) {
+function resolveRegistryIntegrity(paths, state, policy, packageName, version, environment) {
   const result = runCommand(
     resolvedNpmCommand(paths, state),
     registryViewArguments(policy, packageName, version),
@@ -2012,7 +2012,7 @@ function resolveRegistryIntegrity(state, policy, packageName, version, environme
   return integrity;
 }
 
-function installCandidatePackage(state, policy, candidateRoot, release, environment) {
+function installCandidatePackage(paths, state, policy, candidateRoot, release, environment) {
   ensureOwnedDirectory(candidateRoot);
   writeFileSync(join(candidateRoot, "package.json"), `${JSON.stringify({
     private: true,
@@ -2171,6 +2171,7 @@ export async function updateV3({
       };
     }
     const integrity = resolveRegistryIntegrity(
+      paths,
       state,
       supplyChainPolicy,
       validatedTarget.packageName,
@@ -2213,7 +2214,7 @@ export async function updateV3({
     const candidateRoot = join(candidatesRoot, releaseId);
     ensureOwnedDirectory(candidatesRoot);
     removeOwnedCandidate(candidateRoot, candidatesRoot);
-    installCandidatePackage(state, supplyChainPolicy, candidateRoot, release, environment);
+    installCandidatePackage(paths, state, supplyChainPolicy, candidateRoot, release, environment);
     const before = releaseTransactionSnapshot(paths, state);
     const nextState = copyDeploymentState(state);
     nextState.currentRelease = releaseId;
