@@ -82,6 +82,10 @@ const ACCEPTED_LICENSES = new Set([
   "ISC",
   "MIT",
   "MPL-2.0",
+  // Public-domain dedication, same LICENSE text (sha256) as the hash-pinned
+  // tweetnacl policy exception in license-exception.json. fast-sha256@1.3.0
+  // (a transitive of standardwebhooks) ships the same Unlicense text.
+  "Unlicense",
 ]);
 const RUNTIME_EXPERIMENT_FILES = [
   "budget-test.mjs",
@@ -179,7 +183,15 @@ function fsyncDirectory(path) {
 }
 
 function readOwnedJson(path) {
-  const stats = lstatSync(path);
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch (error) {
+    // A missing state file is a corrupted deployment, not a free-form ENOENT
+    // whose path-laden message the update-local catch would reduce to "unknown".
+    if (error && error.code === "ENOENT") throw new Error("deployment-state-unsafe");
+    throw error;
+  }
   if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats) || (stats.mode & 0o077) !== 0) {
     throw new Error("deployment-state-unsafe");
   }
@@ -188,6 +200,21 @@ function readOwnedJson(path) {
 
 function writeOwnedJson(path, value) {
   atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+// lstatSync throws ENOENT with a free-form message (path, spaces) that the
+// update-local catch reduces to "unknown". Wrap expected-file checks so a
+// missing or non-regular file surfaces a structured refusal code instead.
+function assertOwnedRegularFile(path, code) {
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch (error) {
+    if (error && error.code === "ENOENT") throw new Error(code);
+    throw error;
+  }
+  if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error(code);
+  return stats;
 }
 
 function validatedHttpsUrl(value, code) {
@@ -229,10 +256,10 @@ export function validateSupplyChainPolicy(policy) {
 }
 
 export function readSupplyChainPolicy(policyPath = SUPPLY_CHAIN_POLICY_PATH) {
-  const stats = lstatSync(policyPath);
-  if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats) || stats.size > 16 * 1024) {
-    throw new Error("supply-chain-policy-file-unsafe");
-  }
+  // A missing policy file is a corrupted deployment; surface a structured code
+  // rather than a free-form ENOENT the update-local catch would mask as "unknown".
+  const stats = assertOwnedRegularFile(policyPath, "supply-chain-policy-file-unsafe");
+  if (stats.size > 16 * 1024) throw new Error("supply-chain-policy-file-unsafe");
   let policy;
   try {
     policy = JSON.parse(readFileSync(policyPath, "utf8"));
@@ -341,14 +368,20 @@ function packagePaths(candidateRoot) {
 
 export function verifyCandidatePackage(candidateRoot, release) {
   const paths = packagePaths(candidateRoot);
-  for (const path of [paths.packageJson, paths.cli, paths.rpcEntry, paths.shrinkwrap, join(candidateRoot, "package-lock.json")]) {
-    const stats = lstatSync(path);
-    if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("candidate-package-file-unsafe");
+  // Upstream >= 1.1.0 stopped shipping npm-shrinkwrap.json in the tarball.
+  // The candidate's package-lock.json is the same lockfileVersion 3 manifest;
+  // use it as the integrity source when the shrinkwrap is absent.
+  const lockfilePath = existsSync(paths.shrinkwrap) ? paths.shrinkwrap : join(candidateRoot, "package-lock.json");
+  for (const path of [paths.packageJson, paths.cli, paths.rpcEntry, lockfilePath]) {
+    assertOwnedRegularFile(path, "candidate-package-file-unsafe");
   }
   const packageMetadata = JSON.parse(readFileSync(paths.packageJson, "utf8"));
+  // Upstream >= 1.1.0 ships bin.pi as dist/bundle/cli.js while keeping the
+  // legacy dist/cli.js shim the gondolin launcher actually executes.
+  const ACCEPTED_BIN_PI = new Set(["dist/cli.js", "dist/bundle/cli.js"]);
   if (packageMetadata.name !== PI_PACKAGE_NAME
     || packageMetadata.version !== release.version
-    || packageMetadata.bin?.pi !== "dist/cli.js") {
+    || (packageMetadata.bin?.pi && !ACCEPTED_BIN_PI.has(packageMetadata.bin.pi))) {
     throw new Error("candidate-package-metadata-mismatch");
   }
   const lock = JSON.parse(readFileSync(join(candidateRoot, "package-lock.json"), "utf8"));
@@ -365,13 +398,26 @@ export function verifyCandidatePackage(candidateRoot, release) {
 }
 
 export function auditPiPackageLicenses(candidatePackageRoot) {
-  const shrinkwrapPath = join(candidatePackageRoot, "npm-shrinkwrap.json");
-  const stats = lstatSync(shrinkwrapPath);
-  if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("candidate-license-metadata-unsafe");
-  const shrinkwrap = JSON.parse(readFileSync(shrinkwrapPath, "utf8"));
+  // Upstream >= 1.1.0 stopped shipping npm-shrinkwrap.json in the installed
+  // package; fall back to the candidate's root package-lock.json (same
+  // lockfileVersion 3 license metadata). candidatePackageRoot is
+  // <candidateRoot>/node_modules/@earendil-works/pi-coding-agent, so the
+  // candidate root is three levels up.
+  const candidateLockPath = join(candidatePackageRoot, "npm-shrinkwrap.json");
+  const usingFallbackLock = !existsSync(candidateLockPath);
+  const lockPath = usingFallbackLock
+    ? join(candidatePackageRoot, "..", "..", "..", "package-lock.json")
+    : candidateLockPath;
+  assertOwnedRegularFile(lockPath, "candidate-license-metadata-unsafe");
+  const shrinkwrap = JSON.parse(readFileSync(lockPath, "utf8"));
   const licenses = {};
   let packageCount = 0;
-  for (const metadata of Object.values(shrinkwrap.packages ?? {})) {
+  for (const [packagePath, metadata] of Object.entries(shrinkwrap.packages ?? {})) {
+    // The candidate's root package-lock entry ("") is a private scaffold with
+    // no license; only real node_modules dependencies carry license metadata.
+    // The intra-package npm-shrinkwrap.json entry ("") is the pi package
+    // itself and carries its own license, so it must be counted.
+    if (packagePath === "" && usingFallbackLock) continue;
     const license = metadata?.license;
     packageCount += 1;
     if (typeof license !== "string" || !ACCEPTED_LICENSES.has(license)) throw new Error("candidate-license-refused");
@@ -410,8 +456,7 @@ function writeReleaseMetadata(candidateRoot, release, source, rpcEntry) {
 
 function readReleaseMetadata(releaseRoot) {
   const path = join(releaseRoot, "release.json");
-  const stats = lstatSync(path);
-  if (!stats.isFile() || stats.isSymbolicLink() || !isOwned(stats)) throw new Error("release-metadata-unsafe");
+  assertOwnedRegularFile(path, "release-metadata-unsafe");
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
@@ -421,7 +466,13 @@ function verifyRelease(releaseRoot) {
 
 function currentReleaseRoot(deploymentRoot) {
   const currentPath = join(deploymentRoot, "current");
-  const stats = lstatSync(currentPath);
+  let stats;
+  try {
+    stats = lstatSync(currentPath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") throw new Error("current-release-unsafe");
+    throw error;
+  }
   if (!stats.isSymbolicLink() || !isOwned(stats)) throw new Error("current-release-unsafe");
   const target = readlinkSync(currentPath);
   if (!/^releases\/[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/.test(target)) throw new Error("current-release-unsafe");

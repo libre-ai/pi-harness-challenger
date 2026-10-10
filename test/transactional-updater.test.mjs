@@ -1206,6 +1206,169 @@ test("la candidate installée doit correspondre exactement à la version et à l
   }
 });
 
+test("verifyCandidatePackage accepte bin.pi en convention bundle (dist/bundle/cli.js) pour upstream >= 1.1.0", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-bundle-bin-");
+  try {
+    const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    mkdirSync(join(packageRoot, "dist", "bundle"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      bin: { pi: "dist/bundle/cli.js" },
+    })}\n`);
+    writeFileSync(join(packageRoot, "dist", "cli.js"), "cli-shim\n");
+    writeFileSync(join(packageRoot, "dist", "bundle", "cli.js"), "cli-bundle\n");
+    writeFileSync(join(packageRoot, "dist", "rpc-entry.js"), "rpc\n");
+    writeFileSync(join(packageRoot, "npm-shrinkwrap.json"), `${JSON.stringify({
+      packages: { "": { license: "MIT" } },
+    })}\n`);
+    writeFileSync(join(root, "package-lock.json"), `${JSON.stringify({
+      packages: {
+        "node_modules/@earendil-works/pi-coding-agent": {
+          version: "1.1.0",
+          integrity: "sha512-bundle-integrity",
+        },
+      },
+    })}\n`);
+    const release = {
+      packageName: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      integrity: "sha512-bundle-integrity",
+    };
+    assert.equal(verifyCandidatePackage(root, release), packageRoot);
+  } finally {
+    cleanup();
+  }
+});
+
+test("verifyCandidatePackage refuse une valeur bin.pi inattendue", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-bad-bin-");
+  try {
+    const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      bin: { pi: "dist/unexpected/cli.js" },
+    })}\n`);
+    writeFileSync(join(packageRoot, "dist", "cli.js"), "cli\n");
+    writeFileSync(join(packageRoot, "dist", "rpc-entry.js"), "rpc\n");
+    writeFileSync(join(packageRoot, "npm-shrinkwrap.json"), `${JSON.stringify({
+      packages: { "": { license: "MIT" } },
+    })}\n`);
+    writeFileSync(join(root, "package-lock.json"), `${JSON.stringify({
+      packages: {
+        "node_modules/@earendil-works/pi-coding-agent": {
+          version: "1.1.0",
+          integrity: "sha512-bundle-integrity",
+        },
+      },
+    })}\n`);
+    assert.throws(
+      () => verifyCandidatePackage(root, {
+        packageName: "@earendil-works/pi-coding-agent",
+        version: "1.1.0",
+        integrity: "sha512-bundle-integrity",
+      }),
+      /candidate-package-metadata-mismatch/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("auditPiPackageLicenses tombe sur package-lock.json quand npm-shrinkwrap.json manque (upstream >= 1.1.0)", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-lock-fallback-");
+  try {
+    const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      bin: { pi: "dist/bundle/cli.js" },
+    })}\n`);
+    writeFileSync(join(packageRoot, "dist", "cli.js"), "cli\n");
+    writeFileSync(join(packageRoot, "dist", "rpc-entry.js"), "rpc\n");
+    // No npm-shrinkwrap.json in the installed package — the 1.1.0 regression.
+    writeFileSync(join(root, "package-lock.json"), `${JSON.stringify({
+      packages: {
+        "": { dependencies: { "@earendil-works/pi-coding-agent": "1.1.0" } },
+        "node_modules/@earendil-works/pi-coding-agent": { version: "1.1.0", license: "MIT" },
+        "node_modules/permissive": { version: "1.0.0", license: "BlueOak-1.0.0" },
+        "node_modules/fast-sha256": { version: "1.3.0", license: "Unlicense" },
+      },
+    })}\n`);
+    assert.deepEqual(auditPiPackageLicenses(packageRoot), {
+      packageCount: 3,
+      licenses: { "BlueOak-1.0.0": 1, MIT: 1, Unlicense: 1 },
+      passes: true,
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("auditPiPackageLicenses refuse une licence non acceptée même via le fallback package-lock.json", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-lock-refuse-");
+  try {
+    const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      bin: { pi: "dist/bundle/cli.js" },
+    })}\n`);
+    writeFileSync(join(packageRoot, "dist", "cli.js"), "cli\n");
+    writeFileSync(join(packageRoot, "dist", "rpc-entry.js"), "rpc\n");
+    writeFileSync(join(root, "package-lock.json"), `${JSON.stringify({
+      packages: {
+        "": {},
+        "node_modules/@earendil-works/pi-coding-agent": { version: "1.1.0", license: "MIT" },
+        "node_modules/viral": { version: "1.0.0", license: "AGPL-3.0" },
+      },
+    })}\n`);
+    assert.throws(
+      () => auditPiPackageLicenses(packageRoot),
+      /candidate-license-refused/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("verifyCandidatePackage et auditPiPackageLicenses signalent un fichier attendu manquant par un code structuré, pas un ENOENT opaque", () => {
+  const { root, cleanup } = temporaryRoot("pi-updater-enoent-structured-");
+  const re = /^[0-9A-Za-z:._-]+$/;
+  try {
+    const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.1.0",
+      bin: { pi: "dist/cli.js" },
+    })}\n`);
+    // cli.js intentionally missing → assertOwnedRegularFile must surface a
+    // structured code rather than a free-form ENOENT the update-local catch
+    // would reduce to "unknown".
+    assert.throws(
+      () => verifyCandidatePackage(root, {
+        packageName: "@earendil-works/pi-coding-agent",
+        version: "1.1.0",
+        integrity: "sha512-x",
+      }),
+      (error) => error instanceof Error && re.test(error.message),
+    );
+    // auditPiPackageLicenses with neither shrinkwrap nor a candidate lock.
+    assert.throws(
+      () => auditPiPackageLicenses(packageRoot),
+      (error) => error instanceof Error && re.test(error.message),
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("le job launchd appelle uniquement le contrôleur déployé avec des sorties neutralisées", () => {
   const plist = renderLaunchAgentPlist({
     home: "/Users/test&user",
