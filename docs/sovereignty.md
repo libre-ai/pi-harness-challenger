@@ -62,7 +62,7 @@ AGPL, SSPL, forbidden, missing, or unknown licenses fail closed. The narrow hist
 `tweetnacl@0.14.5` exception is bound to the Gondolin version and recorded hashes; it is
 not a general Unlicense allowance.
 
-The Gondolin lockfile pins `undici` 6.28.1 under MIT. Completion requires
+The Gondolin lockfile pins `undici` 6.29.1 under MIT. Completion requires
 `npm audit --omit=dev` to report zero known production vulnerabilities. Automated
 `npm audit fix` is prohibited because it can mutate unrelated transitive versions
 without the repository's qualification evidence.
