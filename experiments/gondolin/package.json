@@ -45,6 +45,7 @@
     "typebox": "1.1.38"
   },
   "overrides": {
-    "undici": "6.28.1"
+    "node-forge": "1.4.3",
+    "undici": "6.29.1"
   }
 }

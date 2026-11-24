@@ -162,7 +162,7 @@ local, capable de réécrire à la fois l'arbre et son manifeste.
 
 ## Dépendances et souveraineté
 
-Le lockfile fixe `undici` 6.28.1 (MIT) et `npm audit --omit=dev` doit rester sans finding.
+Le lockfile fixe `undici` 6.29.1 (MIT) et `npm audit --omit=dev` doit rester sans finding.
 Le profil réseau par défaut est explicitement `upstream-exception` / `not-sovereign` :
 `pi.dev`, le registre npm et GitHub Actions n'apportent pas les preuves de résidence,
 d'opérateur et d'entité juridique UE requises. Une variante compatible peut conserver
